@@ -1,4 +1,5 @@
 # Written by Niels Zeilemaker, Egbert Bouman
+from twisted.internet import reactor
 import wx
 import os
 import sys
@@ -17,14 +18,13 @@ from Tribler.Core.CacheDB.sqlitecachedb import forceDBThread
 
 from Tribler.Main.vwxGUI import (warnWxThread, GRADIENT_DGREY, SEPARATOR_GREY, LIST_AT_HIGHLIST, LIST_SELECTED,
                                  LIST_EXPANDED, format_time, LIST_DARKBLUE, LIST_DESELECTED, THUMBNAIL_FILETYPES)
-from Tribler.Main.vwxGUI.UserDownloadChoice import UserDownloadChoice
 from Tribler.Main.vwxGUI.widgets import _set_font, TagText, ActionButton, ProgressButton, MaxBetterText, FancyPanel
 from Tribler.Main.vwxGUI.list_body import ListItem
 from Tribler.Main.vwxGUI.GuiUtility import GUIUtility
 from Tribler.Main.vwxGUI.GuiImageManager import GuiImageManager, SMALL_ICON_MAX_DIM
 from Tribler.Main.Utility.GuiDBTuples import Torrent, CollectedTorrent
 
-from Tribler.Main.globals import DefaultDownloadStartupConfig
+from Tribler.Core.DownloadConfig import DefaultDownloadStartupConfig
 from Tribler.Core.Video.VideoUtility import limit_resolution
 from Tribler.Core.TorrentDef import TorrentDef
 
@@ -74,7 +74,8 @@ class DoubleLineListItem(ListItem):
                     bmp = ActionButton(self, bitmap=icon[0], hover=False)
                     bmp.SetBitmapDisabled(icon[1] or icon[0])
                     bmp.SetBitmapHover(icon[1] or icon[0])
-                    bmp.SetToolTipString(icon[2])
+                    if sys.platform != 'darwin':
+                        bmp.SetToolTipString(icon[2])
                     bmp.Bind(wx.EVT_LEFT_UP, icon[3] if len(icon) > 3 else None)
                     bmp.Show(icon[4] if len(icon) > 4 else True)
                     if index < len(self.icons) - 1:
@@ -212,11 +213,12 @@ class DoubleLineListItem(ListItem):
         new_icons = self.GetIcons()
         for index, new_icon in enumerate(new_icons):
             if new_icon and (new_icon[0].ConvertToImage().GetData() != self.icons[index].GetBitmapLabel().ConvertToImage().GetData() or
-                             new_icon[2] != self.icons[index].GetToolTip().GetTip()):
+                                 (self.icons[index].GetToolTip() is not None and new_icon[2] != self.icons[index].GetToolTip().GetTip())):
                 self.icons[index].SetBitmapLabel(new_icon[0])
                 self.icons[index].SetBitmapDisabled(new_icon[1] or new_icon[0])
                 self.icons[index].SetBitmapHover(new_icon[1] or new_icon[0])
-                self.icons[index].SetToolTipString(new_icon[2])
+                if sys.platform != 'darwin':
+                    self.icons[index].SetToolTipString(new_icon[2])
                 self.icons[index].Bind(wx.EVT_LEFT_UP, new_icon[3] if len(new_icon) > 3 else None)
                 self.icons[index].Enable(True)
                 self.icons[index].Show(True)
@@ -252,7 +254,7 @@ class DoubleLineListItem(ListItem):
     @warnWxThread
     def GetContextMenu(self):
         menu = wx.Menu()
-        self.GetSubMenu([{'title': 'Show labels..',
+        self.GetSubMenu([{'title': 'Show columns',
                           'handler': [{'title': c['name'], 'type': 'check', 'enable': c['name'] != 'Name', 'check': c.get('show', True),
                                        'handler': lambda e, i=i: self.OnShowColumn(e, i)} for i, c in enumerate(self.columns)]}], menu)
         return menu
@@ -600,7 +602,6 @@ class TorrentListItem(DoubleLineListItemWithButtons):
             # remote channel link to force reload
             for torrent in added:
                 del torrent.channel
-                torrent.channel
 
             if len(added) == 1:
                 def gui_call():
@@ -621,7 +622,6 @@ class TorrentListItem(DoubleLineListItemWithButtons):
     def OnExplore(self, event):
         torrents = self.guiutility.frame.top_bg.GetSelectedTorrents()
         for torrent in torrents:
-            path = None
             if torrent.ds:
                 download = torrent.ds.get_download()
                 if isinstance(download.get_def(), TorrentDef):
@@ -692,8 +692,7 @@ class TorrentListItem(DoubleLineListItemWithButtons):
         # If libtorrent hasn't moved the files yet, move them now
         if not storage_moved:
             self._logger.info("Moving from %s to %s newdir %s", old, new, new_dir)
-            movelambda = lambda: rename_or_merge(old, new)
-            self.guiutility.utility.session.lm.threadpool.add_task(movelambda, 0.0)
+            reactor.callFromThread(rename_or_merge, old, new)
 
     def OnDClick(self, event):
         self.guiutility.frame.top_bg.OnDownload(None, [self.original_data])
@@ -711,7 +710,8 @@ class TorrentListItem(DoubleLineListItemWithButtons):
             if 'completed' in torrent.state or 'seeding' in torrent.state:
                 tdef = torrent.ds.get_download().get_def() if torrent.ds else None
                 if tdef:
-                    if UserDownloadChoice.get_singleton().get_download_state(tdef.get_infohash()) == 'restartseed':
+                    tribler_config = self.guiutility.utility.session.tribler_config
+                    if tribler_config.get_download_state(tdef.get_infohash()) == 'restartseed':
                         enable = False
                         break
         event.Enable(enable)
@@ -1124,6 +1124,13 @@ class ThumbnailListItem(ThumbnailListItemNoTorrent, TorrentListItem):
     def SetThumbnailIcon(self):
         pass
 
+class CreditMiningListItem(ListItem):
+
+    def AddComponents(self, leftSpacer, rightSpacer):
+        ListItem.AddComponents(self, 5, 5)
+
+    def GetIcons(self):
+        return []
 
 class ActivityListItem(ListItem):
 
@@ -1132,7 +1139,7 @@ class ActivityListItem(ListItem):
 
     def AddComponents(self, leftSpacer, rightSpacer):
         ListItem.AddComponents(self, leftSpacer, rightSpacer)
-        if self.data[0] in ['Results', 'Channels', 'Downloads', 'Videoplayer']:
+        if self.data[0] in ['Results', 'Channels', 'Downloads', 'Credit Mining', 'Videoplayer']:
             self.num_items = TagText(self, -1, label='0', fill_colour=GRADIENT_DGREY, edge_colour=SEPARATOR_GREY)
             self.hSizer.Add(self.num_items, 0, wx.CENTER | wx.RIGHT, 5)
             self.hSizer.Layout()

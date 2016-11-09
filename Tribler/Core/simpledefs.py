@@ -47,6 +47,7 @@ STATEDIR_METADATA_STORE_DIR = u'collected_metadata'
 STATEDIR_SESSCONFIG = 'libtribler.conf'
 STATEDIR_DLCONFIG = 'tribler.conf'
 STATEDIR_GUICONFIG = 'tribler.conf'
+STATEDIR_CONFIG = 'triblerd.conf'
 
 # For observer/callback mechanism, see Session.add_observer()
 
@@ -54,6 +55,8 @@ STATEDIR_GUICONFIG = 'tribler.conf'
 NTFY_METADATA = 'metadata'
 NTFY_PEERS = 'peers'
 NTFY_TORRENTS = 'torrents'
+NTFY_TORRENT = 'torrent'
+NTFY_CHANNEL = 'channel'
 NTFY_PLAYLISTS = 'playlists'
 NTFY_COMMENTS = 'comments'
 NTFY_MODIFICATIONS = 'modifications'
@@ -79,6 +82,7 @@ NTFY_ONCREATED_E2E = 'oncreatedendtoend'
 NTFY_IP_CREATED = 'intropointcreated'
 NTFY_RP_CREATED = 'rendezvouspointcreated'
 NTFY_UPGRADER = 'upgraderdone'
+NTFY_UPGRADER_TICK = 'upgradertick'
 
 NTFY_STARTUP_TICK = 'startuptick'
 NTFY_CLOSE_TICK = 'closetick'
@@ -86,17 +90,22 @@ NTFY_CLOSE_TICK = 'closetick'
 # non data handler subjects
 NTFY_ACTIVITIES = 'activities'  # an activity was set (peer met/dns resolved)
 NTFY_REACHABLE = 'reachable'  # the Session is reachable from the Internet
+NTFY_TRIBLER = 'tribler'  # notifications regarding Tribler in general
 NTFY_DISPERSY = 'dispersy'  # an notification regarding dispersy
+NTFY_WATCH_FOLDER_CORRUPT_TORRENT = 'corrupt_torrent'  # a corrupt torrent has been found in the watch folder
+NTFY_NEW_VERSION = 'newversion' # a new version of Tribler is available
 
 # changeTypes
 NTFY_UPDATE = 'update'  # data is updated
 NTFY_INSERT = 'insert'  # new data is inserted
 NTFY_DELETE = 'delete'  # data is deleted
 NTFY_CREATE = 'create'  # new data is created, meaning in the case of Channels your own channel is created
+NTFY_SCRAPE = 'scrape'
 NTFY_STARTED = 'started'
 NTFY_STATE = 'state'
 NTFY_MODIFIED = 'modified'
 NTFY_FINISHED = 'finished'
+NTFY_ERROR = 'error'
 NTFY_MAGNET_STARTED = 'magnet_started'
 NTFY_MAGNET_GOT_PEERS = 'magnet_peers'
 NTFY_MAGNET_PROGRESS = 'magnet_progress'
@@ -111,6 +120,8 @@ NTFY_EXTENDED_FOR = 'extended_for'
 NTFY_BROKEN = 'broken'
 NTFY_SELECT = 'select'
 NTFY_JOINED = 'joined'
+NTFY_REMOVE = 'remove'
+NTFY_DISCOVERED = 'discovered'
 
 # object IDs for NTFY_ACTIVITIES subject
 NTFY_ACT_NONE = 0

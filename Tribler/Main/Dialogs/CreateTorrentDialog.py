@@ -4,6 +4,7 @@
 import os
 from threading import Event
 from traceback import print_exc
+from twisted.internet import reactor
 
 import wx
 
@@ -245,11 +246,13 @@ class CreateTorrentDialog(wx.Dialog):
                 try:
                     if self.combineRadio.GetValue():
                         params['name'] = self.specifiedName.GetValue()
-                        create_torrent_file(self.selectedPaths, params, self._torrentCreated)
+                        result = create_torrent_file(self.selectedPaths, params)
+                        self._torrentCreated(result)
                     else:
                         for path in self.selectedPaths:
                             if os.path.isfile(path):
-                                create_torrent_file([path], params, self._torrentCreated)
+                                result = create_torrent_file([path], params)
+                                self._torrentCreated(result)
                 except:
                     print_exc()
 
@@ -271,7 +274,7 @@ class CreateTorrentDialog(wx.Dialog):
                 self.progressDlg.Pulse()
                 self.progressDlg.cur = 0
 
-                GUIUtility.getInstance().utility.session.lm.threadpool.call_in_thread(0, create_torrents)
+                reactor.callInThread(create_torrents)
 
             if params['piece length']:
                 total_size = 0

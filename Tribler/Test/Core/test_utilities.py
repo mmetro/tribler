@@ -1,4 +1,6 @@
 from nose.tools import raises
+
+from Tribler.Core.Utilities.encoding import add_url_params
 from Tribler.Core.Utilities.utilities import validTorrentFile, isValidTorrentFile, parse_magnetlink
 from Tribler.Test.Core.base_test import TriblerCoreTest
 
@@ -166,6 +168,10 @@ class TriblerCoreTestUtilities(TriblerCoreTest):
         validTorrentFile({"info": {"name": "my_torrent", "piece length": 12345, "pieces": "12345678901234567890",
                                    "files": [{"length": 42, "path": ["/foo/bar"]}]}, "url-list": []})
 
+    def test_valid_torrent_file_url_list_string(self):
+        validTorrentFile({"info": {"name": "my_torrent", "piece length": 12345, "pieces": "12345678901234567890",
+                                   "length": 42}, "url-list": "http://google.com"})
+
     def test_valid_torrent_file_url_list_wrong_type(self):
         validTorrentFile({"info": {"name": "my_torrent", "piece length": 12345, "pieces": "12345678901234567890",
                                    "length": 42}, "url-list": ()})
@@ -212,3 +218,17 @@ class TriblerCoreTestUtilities(TriblerCoreTest):
     def test_parse_magnetlink_nomagnet(self):
         result = parse_magnetlink("http://")
         self.assertEqual(result, (None, None, []))
+
+    def test_add_url_param_some_present(self):
+        url = 'http://stackoverflow.com/test?answers=true'
+        new_params = {'answers': False, 'data': ['some', 'values']}
+        result = add_url_params(url, new_params)
+        self.assertEqual(result, 'http://stackoverflow.com/test?data=some&data=values&answers=false')
+
+    def test_add_url_param_clean(self):
+        url = 'http://stackoverflow.com/test'
+        new_params = {'data': ['some', 'values']}
+        result = add_url_params(url, new_params)
+        self.assertEqual(result, 'http://stackoverflow.com/test?data=some&data=values')
+
+

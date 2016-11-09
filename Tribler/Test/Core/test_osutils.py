@@ -62,13 +62,10 @@ class Test_OsUtils(BaseTestCase):
             assert fixedname == name_table[name], (fixedname, name_table[name])
 
     def test_is_android(self):
-        # act like the computer is an Android
-        self.assertFalse(is_android())
-        os.environ["ANDROID_HOST"] = "ANDROID_HOST"
-        self.assertTrue(is_android())
-        self.assertTrue(is_android(strict=True))
-        os.environ["ANDROID_HOST"] = "HOST"
-        self.assertFalse(is_android(strict=True))
+        if sys.platform.startswith('linux') and 'ANDROID_PRIVATE' in os.environ:
+            self.assertTrue(is_android())
+        else:
+            self.assertFalse(is_android())
 
     def test_home_dir(self):
         home_dir = get_home_dir()

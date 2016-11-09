@@ -140,7 +140,10 @@ copy vlc.py dist\installdir\vlc.py
 mkdir dist\installdir\tools
 copy win\tools\reset*.bat dist\installdir\tools
 
-copy C:\build\vc_redist.exe dist\installdir
+REM Laurens, 2016-04-20: Copy the redistributables of 2008, 2010 and 2012 to the install dir
+copy C:\build\vc_redist_90.exe dist\installdir
+copy C:\build\vc_redist_100.exe dist\installdir
+copy C:\build\vc_redist_110.exe dist\installdir
 
 REM MainClient specific
 
@@ -159,9 +162,9 @@ copy Tribler\Main\vwxGUI\images\flags\*.* dist\installdir\Tribler\Main\vwxGUI\im
 copy Tribler\Main\webUI\static\*.* dist\installdir\Tribler\Main\webUI\static
 copy Tribler\Main\webUI\static\images\*.* dist\installdir\Tribler\Main\webUI\static\images
 copy Tribler\Main\webUI\static\lang\*.* dist\installdir\Tribler\Main\webUI\static\lang
-mkdir dist\installdir\Tribler\Category
-copy Tribler\Category\category.conf dist\installdir\Tribler\Category
-copy Tribler\Category\filter_terms.filter dist\installdir\Tribler\Category
+mkdir dist\installdir\Tribler\Core\Category
+copy Tribler\Core\Category\category.conf dist\installdir\Tribler\Core\Category
+copy Tribler\Core\Category\filter_terms.filter dist\installdir\Tribler\Core\Category
 
 @echo Running NSIS
 cd dist\installdir

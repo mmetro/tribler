@@ -48,6 +48,30 @@ class NotYetImplementedException(TriblerException):
         TriblerException.__init__(self, msg)
 
 
+class HttpError(TriblerException):
+
+    """ HTTP error code 400+ """
+
+    def __init__(self, response=None, msg=None):
+        TriblerException.__init__(self, msg)
+        self.response = response
+
+
+class DuplicateChannelNameError(TriblerException):
+
+    """ The Channel name already exists in the ChannelManager channel list,
+    i.e., one of your own Channels with the same name already exists. """
+
+    pass
+
+
+class DuplicateTorrentFileError(TriblerException):
+
+    """ The Torrent already exists in the Channel you try to add it to. """
+
+    pass
+
+
 class DuplicateDownloadException(TriblerException):
 
     """ The Download already exists in the Session, i.e., a Download for
@@ -64,6 +88,7 @@ class TorrentDefNotFinalizedException(TriblerException):
 
     def __init__(self, msg=None):
         TriblerException.__init__(self, msg)
+
 
 class TorrentFileException(TriblerException):
 

@@ -1,12 +1,11 @@
 # Written by Niels Zeilemaker, Egbert Bouman
-import wx
 import sys
 import logging
 
-from Tribler.Category.Category import Category
+import wx
 
+from Tribler.Core.Category.Category import Category
 from Tribler.community.channel.community import ChannelCommunity
-
 from Tribler.Main.Utility.GuiDBTuples import Channel, Playlist
 from Tribler.Main.vwxGUI import SEPARATOR_GREY, FILTER_GREY, warnWxThread
 from Tribler.Main.vwxGUI.GuiUtility import GUIUtility
@@ -14,8 +13,8 @@ from Tribler.Main.vwxGUI.GuiImageManager import GuiImageManager
 from Tribler.Main.vwxGUI.list_item import (ColumnsManager, TorrentListItem, ChannelListItem, LibraryListItem,
                                            ChannelListItemNoButton, PlaylistItemNoButton, PlaylistItem)
 from Tribler.Main.vwxGUI.list_body import FixedListBody
-from Tribler.Main.vwxGUI.widgets import MinMaxSlider, LinkStaticText, LinkText, BetterText as StaticText, _set_font
-
+from Tribler.Main.vwxGUI.widgets import MinMaxSlider, LinkStaticText, LinkText, BetterText as StaticText, _set_font, \
+    ActionButton
 from Tribler.Main.Utility.utility import size_format
 
 
@@ -536,6 +535,36 @@ class BaseFilter(wx.Panel):
     def FilterCorrect(self, regex_correct):
         pass
 
+    def OnShowColumn(self, event, index):
+        self.columns[index]['show'] = not self.columns[index].get('show', True)
+        guiUtility = GUIUtility.getInstance()
+
+        hide_columns = guiUtility.ReadGuiSetting("hide_columns", default={})
+        hide_columns[type(self).__name__] = hide_columns.get(type(self).__name__, {})
+        hide_columns[type(self).__name__].update({self.columns[index]['name']: self.columns[index]['show']})
+        guiUtility.WriteGuiSetting("hide_columns", hide_columns)
+
+        if getattr(self.parent_list, 'ResetBottomWindow', False):
+            self.parent_list.ResetBottomWindow()
+        wx.CallAfter(self.parent_list.list.Rebuild)
+
+    def OnPopupShow(self, event):
+        menu = wx.Menu()
+        for index, column in enumerate(self.columns):
+            handler = lambda e, i=index: self.OnShowColumn(e, i)
+            itemid = wx.NewId()
+            menu.AppendCheckItem(itemid, column['name'])
+            if column.get('show', True):
+                menu.Check(itemid, True)
+            if column['name'] == 'Name':
+                menu.Enable(itemid, False)
+            wx.EVT_MENU(self, itemid, handler)
+        pos = wx.Point(self.showlabel.GetPosition().x,
+                       self.filter_panel.GetPosition().y + self.filter_panel.GetSize().y)
+        self.PopupMenu(menu, pos)
+        menu.Destroy()
+        self.Layout()
+
 
 class TorrentFilter(BaseFilter):
 
@@ -573,20 +602,41 @@ class TorrentFilter(BaseFilter):
         self.filetype = LinkStaticText(panel, 'File type', None, font_colour=wx.BLACK)
         self.filetype.Bind(wx.EVT_LEFT_DOWN, self.OnPopupFileType)
 
+        self.show_icon = wx.StaticBitmap(panel, -1, self.icon_right)
+        self.showlabel = LinkStaticText(panel, 'Show', None, font_colour=wx.BLACK)
+        self.showlabel.Bind(wx.EVT_LEFT_DOWN, self.OnPopupShow)
+
         self.filesize_str = StaticText(panel, -1, 'File size:')
         self.filesize = MinMaxSlider(panel, -1)
         self.filesize.SetFormatter(size_format)
 
         self.search = None
 
+        grid_icon = GuiImageManager.getInstance().getImage(u"grid.png")
+        grid_icon_active = GuiImageManager.getInstance().getImage('grid_active.png')
+
+        self.grid_button = ActionButton(panel, bitmap=grid_icon)
+        self.grid_button.SetToolTipString("Show grid")
+
+        def toggle_grid(event):
+            if self.parent_list.display_grid:
+                self.grid_button.SetBitmapLabel(grid_icon, recreate=True)
+            else:
+                self.grid_button.SetBitmapLabel(grid_icon_active, recreate=True)
+            self.parent_list.ToggleGrid()
+
+        self.grid_button.Bind(wx.EVT_LEFT_UP, toggle_grid)
+
+        search_container_panel = wx.Panel(panel)
+
         if sys.platform == 'darwin':
-            self.search = wx.TextCtrl(panel)
+            self.search = wx.TextCtrl(search_container_panel)
             self.search.SetHint('Filter results')
-            self.search.SetMinSize((175, 20))
+            self.search.SetSize((175, 20))
         else:
-            self.search = wx.SearchCtrl(panel)
+            self.search = wx.SearchCtrl(search_container_panel)
             self.search.SetDescriptiveText('Filter results')
-            self.search.SetMinSize((175, -1))
+            self.search.SetSize((175, -1))
 
         self.search.Bind(wx.EVT_TEXT, self.OnKey)
 
@@ -594,14 +644,19 @@ class TorrentFilter(BaseFilter):
         hSizer.AddSpacer((self.spacers[0], -1))
         hSizer.Add(self.sortby_icon, 0, wx.CENTER | wx.RIGHT, 3)
         hSizer.Add(self.sortby, 0, wx.CENTER)
-        hSizer.AddSpacer((45, -1))
+        hSizer.AddSpacer((30, -1))
         hSizer.Add(self.filetype_icon, 0, wx.CENTER | wx.RIGHT, 3)
         hSizer.Add(self.filetype, 0, wx.CENTER)
-        hSizer.AddSpacer((45, -1))
+        hSizer.AddSpacer((30, -1))
+        hSizer.Add(self.show_icon, 0, wx.CENTER | wx.RIGHT, 3)
+        hSizer.Add(self.showlabel, 0, wx.CENTER)
+        hSizer.AddSpacer((30, -1))
         hSizer.Add(self.filesize_str, 0, wx.CENTER | wx.RIGHT, 10)
         hSizer.Add(self.filesize, 0, wx.CENTER)
         hSizer.AddStretchSpacer()
-        hSizer.Add(self.search, 0, wx.CENTER)
+        hSizer.Add(self.grid_button, 0, wx.CENTER, 3)
+        hSizer.AddSpacer((4, -1))
+        hSizer.Add(search_container_panel, 0, wx.CENTER)
         hSizer.AddSpacer((self.spacers[1], -1))
         self.filter_sizer = hSizer
 
@@ -657,7 +712,7 @@ class TorrentFilter(BaseFilter):
         menu.AppendRadioItem(itemid, "All")
         menu.Bind(wx.EVT_MENU, lambda x: self.CategoryFilter(''), id=itemid)
         menu.Check(itemid, not self.parent_list.categoryfilter)
-        for _, filetype in Category.getInstance().getCategoryNames():
+        for _, filetype in self.guiutility.utility.session.lm.category.getCategoryNames():
             if filetype != 'XXX':
                 itemid = wx.NewId()
                 menu.AppendRadioItem(itemid, filetype)
@@ -797,9 +852,6 @@ class SelectedChannelFilter(TorrentFilter):
             self.search.SetHint('Filter content')
         else:
             self.search.SetDescriptiveText('Filter content')
-        button = wx.ToggleButton(self.filter_panel, -1, 'Show grid')
-        button.Bind(wx.EVT_TOGGLEBUTTON, lambda evt: self.parent_list.SetGrid(evt.GetEventObject().GetValue()))
-        self.filter_sizer.Insert(len(self.filter_sizer.GetChildren()) - 2, button, 0, wx.CENTER | wx.RIGHT, 3)
 
 
 class SelectedPlaylistFilter(TorrentFilter):
@@ -845,16 +897,20 @@ class ChannelFilter(BaseFilter):
         self.channeltype = LinkStaticText(panel, 'Channel type', None, font_colour=wx.BLACK)
         self.channeltype.Bind(wx.EVT_LEFT_DOWN, self.OnPopupChannelType)
 
-        self.search = None
+        self.show_icon = wx.StaticBitmap(panel, -1, self.icon_right)
+        self.showlabel = LinkStaticText(panel, 'Show', None, font_colour=wx.BLACK)
+        self.showlabel.Bind(wx.EVT_LEFT_DOWN, self.OnPopupShow)
+
+        search_container_panel = wx.Panel(panel)
 
         if sys.platform == 'darwin':
-            self.search = wx.TextCtrl(panel)
+            self.search = wx.TextCtrl(search_container_panel)
             self.search.SetHint('Filter channels')
-            self.search.SetMinSize((175, 22))
+            self.search.SetSize((175, 22))
         else:
-            self.search = wx.SearchCtrl(panel)
+            self.search = wx.SearchCtrl(search_container_panel)
             self.search.SetDescriptiveText('Filter channels')
-            self.search.SetMinSize((175, -1))
+            self.search.SetSize((175, -1))
 
         self.search.Bind(wx.EVT_TEXT, self.OnKey)
 
@@ -862,11 +918,14 @@ class ChannelFilter(BaseFilter):
         hSizer.AddSpacer((self.spacers[0], -1))
         hSizer.Add(self.sortby_icon, 0, wx.CENTER | wx.RIGHT, 3)
         hSizer.Add(self.sortby, 0, wx.CENTER)
-        hSizer.AddSpacer((45, -1))
+        hSizer.AddSpacer((30, -1))
         hSizer.Add(self.channeltype_icon, 0, wx.CENTER | wx.RIGHT, 3)
         hSizer.Add(self.channeltype, 0, wx.CENTER)
+        hSizer.AddSpacer((30, -1))
+        hSizer.Add(self.show_icon, 0, wx.CENTER | wx.RIGHT, 3)
+        hSizer.Add(self.showlabel, 0, wx.CENTER)
         hSizer.AddStretchSpacer()
-        hSizer.Add(self.search, 0, wx.CENTER)
+        hSizer.Add(search_container_panel, 0, wx.CENTER)
         hSizer.AddSpacer((self.spacers[1], -1))
         self.filter_sizer = hSizer
 
@@ -1005,22 +1064,28 @@ class DownloadFilter(BaseFilter):
         self.sortby = LinkStaticText(panel, 'Sort by', None, font_colour=wx.BLACK)
         self.sortby.Bind(wx.EVT_LEFT_DOWN, self.OnPopupSort)
 
+        self.show_icon = wx.StaticBitmap(panel, -1, self.icon_right)
+        self.showlabel = LinkStaticText(panel, 'Show', None, font_colour=wx.BLACK)
+        self.showlabel.Bind(wx.EVT_LEFT_DOWN, self.OnPopupShow)
+
         self.filesize_str = StaticText(panel, -1, 'File size:')
         self.filesize = MinMaxSlider(panel, -1)
         self.filesize.SetFormatter(size_format)
 
         self.state_icon = wx.StaticBitmap(panel, -1, self.icon_right)
-        self.state = LinkStaticText(panel, 'Download state', None, font_colour=wx.BLACK)
+        self.state = LinkStaticText(panel, 'State', None, font_colour=wx.BLACK)
         self.state.Bind(wx.EVT_LEFT_DOWN, self.OnPopupState)
 
+        search_container_panel = wx.Panel(panel)
+
         if sys.platform == 'darwin':
-            self.search = wx.TextCtrl(panel)
+            self.search = wx.TextCtrl(search_container_panel)
             self.search.SetHint('Filter downloads')
-            self.search.SetMinSize((175, 22))
+            self.search.SetSize((175, 22))
         else:
-            self.search = wx.SearchCtrl(panel)
+            self.search = wx.SearchCtrl(search_container_panel)
             self.search.SetDescriptiveText('Filter downloads')
-            self.search.SetMinSize((175, -1))
+            self.search.SetSize((175, -1))
 
         self.search.Bind(wx.EVT_TEXT, self.OnKey)
 
@@ -1028,14 +1093,17 @@ class DownloadFilter(BaseFilter):
         hSizer.AddSpacer((self.spacers[0], -1))
         hSizer.Add(self.sortby_icon, 0, wx.CENTER | wx.RIGHT, 3)
         hSizer.Add(self.sortby, 0, wx.CENTER)
-        hSizer.AddSpacer((45, -1))
+        hSizer.AddSpacer((30, -1))
         hSizer.Add(self.state_icon, 0, wx.CENTER | wx.RIGHT, 3)
         hSizer.Add(self.state, 0, wx.CENTER)
-        hSizer.AddSpacer((45, -1))
+        hSizer.AddSpacer((30, -1))
+        hSizer.Add(self.show_icon, 0, wx.CENTER | wx.RIGHT, 3)
+        hSizer.Add(self.showlabel, 0, wx.CENTER)
+        hSizer.AddSpacer((30, -1))
         hSizer.Add(self.filesize_str, 0, wx.CENTER | wx.RIGHT, 10)
         hSizer.Add(self.filesize, 0, wx.CENTER)
         hSizer.AddStretchSpacer()
-        hSizer.Add(self.search, 0, wx.CENTER)
+        hSizer.Add(search_container_panel, 0, wx.CENTER)
         hSizer.AddSpacer((self.spacers[1], -1))
         self.filter_sizer = hSizer
 

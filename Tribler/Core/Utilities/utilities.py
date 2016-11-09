@@ -8,8 +8,15 @@ from traceback import print_exc
 from urlparse import urlsplit, parse_qsl
 import binascii
 import logging
-
 from libtorrent import bencode, bdecode
+
+from twisted.internet import reactor
+from twisted.web import http
+from twisted.web.client import Agent, readBody
+from twisted.web.http_headers import Headers
+
+from Tribler.Core.version import version_id
+from Tribler.Core.exceptions import HttpError
 
 logger = logging.getLogger(__name__)
 
@@ -142,8 +149,11 @@ def validTorrentFile(metainfo):
             del metainfo['url-list']
             logger.warn("Warning: Only single-file mode supported with HTTP seeding. HTTP seeding disabled")
         elif not isinstance(metainfo['url-list'], ListType):
-            del metainfo['url-list']
-            logger.warn("Warning: url-list is not of type list. HTTP seeding disabled")
+            if isinstance(metainfo['url-list'], StringType):
+                metainfo['url-list'] = [metainfo['url-list']]
+            else:
+                del metainfo['url-list']
+                logger.warn("Warning: url-list is not of type list/string. HTTP seeding disabled")
         else:
             for url in metainfo['url-list']:
                 if not isValidURL(url):
@@ -167,8 +177,8 @@ def isValidTorrentFile(metainfo):
     try:
         validTorrentFile(metainfo)
         return True
-    except:
-        print_exc()
+    except ValueError:
+        logger.exception("Could not check torrent file: a ValueError was thrown")
         return False
 
 
@@ -180,6 +190,23 @@ def isValidURL(url):
     if r[0] == '' or r[1] == '':
         return False
     return True
+
+
+def http_get(uri):
+
+    def _on_response(response):
+        if response.code == http.OK:
+            return readBody(response)
+        raise HttpError(response)
+
+    agent = Agent(reactor)
+    deferred = agent.request(
+        'GET',
+        uri,
+        Headers({'User-Agent': ['Tribler ' + version_id]}),
+        None)
+    deferred.addCallback(_on_response)
+    return deferred
 
 
 def parse_magnetlink(url):
@@ -241,3 +268,43 @@ def fix_torrent(file_path):
         fixed_data = bencode(fixed_data)
 
     return fixed_data
+
+
+def translate_peers_into_health(peer_info_dicts):
+    """
+    peer_info_dicts is a peer_info dictionary from LibTorrentDownloadImpl.create_peerlist_data
+    purpose : where we want to measure a swarm's health but no tracker can be contacted
+    """
+    upload_only = 0
+    finished = 0
+    unfinished_able_dl = 0
+    interest_in_us = 0
+
+    # collecting some statistics
+    for p_info in peer_info_dicts:
+        upload_only_b = False
+
+        if p_info['upload_only']:
+            upload_only += 1
+            upload_only_b = True
+        if p_info['uinterested']:
+            interest_in_us += 1
+        if p_info['completed'] == 1:
+            finished += 1
+        else:
+            unfinished_able_dl += 1 if upload_only_b else 0
+
+    # seeders potentials:
+    # 1. it's only want uploading right now (upload only)
+    # 2. it's finished (we don't know whether it want to upload or not)
+    # leecher potentials:
+    # 1. it's interested in our piece
+    # 2. it's unfinished but it's not 'upload only' (it can't leech for some reason)
+    # 3. it's unfinished (less restrictive)
+
+    # make sure to change those description when changing the algorithm
+
+    num_seeders = max(upload_only, finished)
+    num_leech = max(interest_in_us, min(unfinished_able_dl, len(peer_info_dicts) - finished))
+    return num_seeders, num_leech
+

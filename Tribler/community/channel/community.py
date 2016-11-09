@@ -8,6 +8,8 @@ from traceback import print_stack
 from twisted.python.threadable import isInIOThread
 
 from Tribler.Core.CacheDB.sqlitecachedb import str2bin
+from Tribler.Core.simpledefs import NTFY_CHANNEL, NTFY_TORRENT
+from Tribler.Core.simpledefs import NTFY_DISCOVERED
 from Tribler.community.channel.payload import ModerationPayload
 from Tribler.dispersy.authentication import MemberAuthentication, NoAuthentication
 from Tribler.dispersy.candidate import CANDIDATE_WALK_LIFETIME
@@ -15,6 +17,7 @@ from Tribler.dispersy.community import Community
 from Tribler.dispersy.conversion import DefaultConversion
 from Tribler.dispersy.destination import CandidateDestination, CommunityDestination
 from Tribler.dispersy.distribution import FullSyncDistribution, DirectDistribution
+from Tribler.dispersy.exception import MetaNotFoundException
 from Tribler.dispersy.message import BatchConfiguration, Message, DropMessage, DelayMessageByProof
 from Tribler.dispersy.resolution import LinearResolution, PublicResolution, DynamicResolution
 from Tribler.dispersy.util import call_on_reactor_thread
@@ -87,7 +90,7 @@ class ChannelCommunity(Community):
                 message = self._get_latest_channel_message()
                 if message:
                     self._channel_id = self.cid
-            except:
+            except (MetaNotFoundException, RuntimeError):
                 pass
 
             from Tribler.community.allchannel.community import AllChannelCommunity
@@ -320,6 +323,11 @@ class ChannelCommunity(Community):
                                                                                  message.payload.name,
                                                                                  message.payload.description)
 
+                self.tribler_session.notifier.notify(NTFY_CHANNEL, NTFY_DISCOVERED, None,
+                                                     {"name": message.payload.name,
+                                                      "description": message.payload.description,
+                                                      "dispersy_cid": self._cid.encode("hex")})
+
                 # emit signal of channel creation if the channel is created by us
                 if authentication_member == self._my_member:
                     self._channel_name = message.payload.name
@@ -405,6 +413,15 @@ class ChannelCommunity(Community):
                      message.payload.files,
                      message.payload.trackers))
                 self._logger.debug("torrent received: %s on channel: %s", hexlify(message.payload.infohash), self._master_member)
+
+                self.tribler_session.notifier.notify(NTFY_TORRENT, NTFY_DISCOVERED, None,
+                                                     {"infohash": hexlify(message.payload.infohash),
+                                                      "timestamp": message.payload.timestamp,
+                                                      "name": message.payload.name,
+                                                      "files": message.payload.files,
+                                                      "trackers": message.payload.trackers,
+                                                      "dispersy_cid": self._cid.encode("hex")})
+
                 if message.candidate and message.candidate.sock_addr:
                     _barter_statistics.dict_inc_bartercast(
                         BartercastStatisticTypes.TORRENTS_RECEIVED,
@@ -715,7 +732,7 @@ class ChannelCommunity(Community):
                 try:
                     data = json.loads(message.payload.modification_value)
                     thumbnail_hash = data[u'thumb_hash'].decode('hex')
-                except:
+                except ValueError:
                     yield DropMessage(message, "Not compatible json format")
                     continue
                 else:
@@ -883,7 +900,10 @@ class ChannelCommunity(Community):
         for dispersy_id in dispersy_ids:
             message = self._dispersy.load_message_by_packetid(self, dispersy_id)
             if message:
-                self.create_undo(message)
+                if not message.undone:
+                    self.create_undo(message)
+                else:
+                    self._disp_undo_playlist_torrent([(None, None, message)])
 
     @call_on_reactor_thread
     def _disp_create_playlist_torrents(self, playlist_packet, infohashes, store=True, update=True, forward=True):

@@ -1,6 +1,7 @@
 import os
 
 import tarfile
+from twisted.internet.defer import inlineCallbacks
 
 from Tribler.Core.CacheDB.SqliteCacheDBHandler import (BasicDBHandler,
                                                        PeerDBHandler, LimitedOrderedDict)
@@ -40,11 +41,13 @@ class AbstractDB(TriblerCoreTest):
         self.config.set_torrent_collecting(False)
         self.config.set_libtorrent(False)
         self.config.set_dht_torrent_collecting(False)
-        self.config.set_videoplayer(False)
+        self.config.set_videoserver_enabled(False)
         self.config.set_torrent_store(False)
 
+    @blocking_call_on_reactor_thread
+    @inlineCallbacks
     def setUp(self):
-        super(AbstractDB, self).setUp()
+        yield super(AbstractDB, self).setUp()
 
         self.setUpPreSession()
         self.session = Session(self.config, ignore_singleton=True)
@@ -59,7 +62,6 @@ class AbstractDB(TriblerCoreTest):
         self.sqlitedb.initialize()
         self.session.sqlite_db = self.sqlitedb
 
-    @blocking_call_on_reactor_thread
     def tearDown(self):
         self.sqlitedb.close()
         self.sqlitedb = None
@@ -68,11 +70,12 @@ class AbstractDB(TriblerCoreTest):
 
         super(AbstractDB, self).tearDown(self)
 
-
 class TestSqliteBasicDBHandler(AbstractDB):
 
+    @blocking_call_on_reactor_thread
+    @inlineCallbacks
     def setUp(self):
-        super(TestSqliteBasicDBHandler, self).setUp()
+        yield super(TestSqliteBasicDBHandler, self).setUp()
         self.db = BasicDBHandler(self.session, u"Peer")
 
     @blocking_call_on_reactor_thread

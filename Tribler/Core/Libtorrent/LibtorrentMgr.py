@@ -10,21 +10,21 @@ from binascii import hexlify
 from copy import deepcopy
 from shutil import rmtree
 
-from twisted.internet import reactor
+from twisted.internet import reactor, threads
+from twisted.internet.defer import succeed, fail
+from twisted.python.failure import Failure
+
 import libtorrent as lt
 from Tribler.Core.Utilities.torrent_utils import get_info_from_handle
 from Tribler.Core.TorrentDef import TorrentDef, TorrentDefNoMetainfo
-
 from Tribler.Core.Utilities.utilities import parse_magnetlink, fix_torrent
-from Tribler.Core.Video.utils import videoextdefaults
 from Tribler.Core.exceptions import DuplicateDownloadException, TorrentFileException
 from Tribler.Core.simpledefs import (NTFY_INSERT, NTFY_MAGNET_CLOSE, NTFY_MAGNET_GOT_PEERS, NTFY_MAGNET_STARTED,
                                      NTFY_REACHABLE, NTFY_TORRENTS)
 from Tribler.Core.version import version_id
-from Tribler.Main.globals import DefaultDownloadStartupConfig
+from Tribler.Core.DownloadConfig import DefaultDownloadStartupConfig
 from Tribler.dispersy.taskmanager import LoopingCall, TaskManager
 from Tribler.dispersy.util import blocking_call_on_reactor_thread, call_on_reactor_thread
-
 
 LTSTATE_FILENAME = "lt.state"
 METAINFO_CACHE_PERIOD = 5 * 60
@@ -154,8 +154,11 @@ class LibtorrentMgr(TaskManager):
             if listen_port != ltsession.listen_port():
                 self.trsession.set_listen_port_runtime(ltsession.listen_port())
             try:
-                lt_state = open(os.path.join(self.trsession.get_state_dir(), LTSTATE_FILENAME)).read()
-                ltsession.load_state(lt.bdecode(lt_state))
+                lt_state = lt.bdecode(open(os.path.join(self.trsession.get_state_dir(), LTSTATE_FILENAME)).read())
+                if lt_state is not None:
+                    ltsession.load_state(lt_state)
+                else:
+                    self._logger.warning("the lt.state appears to be corrupt, writing new data on shutdown")
             except Exception, exc:
                 self._logger.info("could not load libtorrent state, got exception: %r. starting from scratch" % exc)
             ltsession.start_dht()
@@ -262,19 +265,19 @@ class LibtorrentMgr(TaskManager):
 
             if infohash in self.metainfo_requests:
                 self._logger.info("killing get_metainfo request for %s", infohash)
-                handle = self.metainfo_requests.pop(infohash)['handle']
-                if handle:
-                    ltsession.remove_torrent(handle, 0)
+                request_handle = self.metainfo_requests.pop(infohash)['handle']
+                if request_handle:
+                    ltsession.remove_torrent(request_handle, 0)
 
-            handle = ltsession.add_torrent(encode_atp(atp))
-            infohash = str(handle.info_hash())
+            torrent_handle = ltsession.add_torrent(encode_atp(atp))
+            infohash = str(torrent_handle.info_hash())
             if infohash in self.torrents:
                 raise DuplicateDownloadException()
             self.torrents[infohash] = (torrentdl, ltsession)
 
             self._logger.debug("added torrent %s", infohash)
 
-            return handle
+            return torrent_handle
 
     def remove_torrent(self, torrentdl, removecontent=False):
         handle = torrentdl.handle
@@ -317,15 +320,20 @@ class LibtorrentMgr(TaskManager):
                     if isinstance(alert, lt.metadata_received_alert):
                         self.got_metainfo(infohash)
                 else:
-                    self._logger.debug("could not find torrent %s", infohash)
+                    self._logger.debug("LibtorrentMgr: could not find torrent %s", infohash)
             else:
-                self._logger.debug("alert for invalid torrent")
+                self._logger.debug("Alert for invalid torrent")
 
     def get_metainfo(self, infohash_or_magnet, callback, timeout=30, timeout_callback=None, notify=True):
         if not self.is_dht_ready() and timeout > 5:
             self._logger.info("DHT not ready, rescheduling get_metainfo")
-            self.trsession.lm.threadpool.add_task(lambda i=infohash_or_magnet, c=callback, t=timeout - 5,
-                                                  tcb=timeout_callback, n=notify: self.get_metainfo(i, c, t, tcb, n), 5)
+
+            def schedule_call():
+                self.register_task("schedule_metainfo_lookup",
+                                   reactor.callLater(5, lambda i=infohash_or_magnet, c=callback, t=timeout - 5,
+                                                  tcb=timeout_callback, n=notify: self.get_metainfo(i, c, t, tcb, n)))
+
+            reactor.callFromThread(schedule_call)
             return
 
         magnet = infohash_or_magnet if infohash_or_magnet.startswith('magnet') else None
@@ -340,12 +348,13 @@ class LibtorrentMgr(TaskManager):
 
             cache_result = self._get_cached_metainfo(infohash)
             if cache_result:
-                self.trsession.lm.threadpool.call_in_thread(0, callback, deepcopy(cache_result))
+                reactor.callInThread(callback, deepcopy(cache_result))
 
             elif infohash not in self.metainfo_requests:
                 # Flags = 4 (upload mode), should prevent libtorrent from creating files
-                atp = {'save_path': self.metadata_tmpdir, 'duplicate_is_error': True, 'paused': False,
-                       'auto_managed': False, 'upload_mode': True}
+                atp = {'save_path': self.metadata_tmpdir,
+                       'flags': (lt.add_torrent_params_flags_t.flag_duplicate_is_error |
+                                 lt.add_torrent_params_flags_t.flag_upload_mode)}
                 if magnet:
                     atp['url'] = magnet
                 else:
@@ -367,8 +376,12 @@ class LibtorrentMgr(TaskManager):
                                                     'callbacks': [callback],
                                                     'timeout_callbacks': [timeout_callback] if timeout_callback else [],
                                                     'notify': notify}
-                self.trsession.lm.threadpool.add_task(lambda: self.got_metainfo(infohash, timeout=True), timeout)
 
+                def schedule_call():
+                    self.register_task("schedule_got_metainfo_lookup",
+                                       reactor.callLater(timeout, lambda: self.got_metainfo(infohash, timeout=True)))
+
+                reactor.callFromThread(schedule_call)
             else:
                 self.metainfo_requests[infohash]['notify'] = self.metainfo_requests[infohash]['notify'] and notify
                 callbacks = self.metainfo_requests[infohash]['callbacks']
@@ -420,7 +433,7 @@ class LibtorrentMgr(TaskManager):
                         self._add_cached_metainfo(infohash, metainfo)
 
                         for callback in callbacks:
-                            self.trsession.lm.threadpool.call_in_thread(0, callback, deepcopy(metainfo))
+                            reactor.callInThread(callback, deepcopy(metainfo))
 
                         # let's not print the hashes of the pieces
                         debuginfo = deepcopy(metainfo)
@@ -429,7 +442,7 @@ class LibtorrentMgr(TaskManager):
 
                     elif timeout_callbacks and timeout:
                         for callback in timeout_callbacks:
-                            self.trsession.lm.threadpool.call_in_thread(0, callback, infohash_bin)
+                            reactor.callInThread(callback, infohash_bin)
 
                 if handle:
                     self.get_session().remove_torrent(handle, 1)
@@ -469,31 +482,24 @@ class LibtorrentMgr(TaskManager):
 
     @call_on_reactor_thread
     def _schedule_next_check(self, delay, retries_left):
-        self.register_task(u'check_dht', reactor.callLater(delay, self._task_check_dht, retries_left))
+        self.register_task(u'check_dht', reactor.callLater(delay, self.do_dht_check, retries_left))
 
-    def _task_check_dht(self, retries_left):
+    def do_dht_check(self, retries_left):
         # Sometimes the dht fails to start. To workaround this issue we monitor the #dht_nodes, and restart if needed.
 
-        def do_dht_check():
-            lt_session = self.get_session()
-            if lt_session:
-                dht_nodes = lt_session.status().dht_nodes
-                if dht_nodes <= 25:
-                    if dht_nodes >= 5 and retries_left > 0:
-                        self._logger.info(u"No enough DHT nodes %s, will try again", lt_session.status().dht_nodes)
-                        self._schedule_next_check(5, retries_left - 1)
-                    else:
-                        self._logger.info(u"No enough DHT nodes %s, will restart DHT", lt_session.status().dht_nodes)
-                        lt_session.start_dht()
-                        self._schedule_next_check(10, 1)
-                else:
-                    self._logger.info("dht is working enough nodes are found (%d)", self.get_session().status().dht_nodes)
-                    self.dht_ready = True
-                    return
+        lt_session = self.get_session()
+        dht_nodes = lt_session.status().dht_nodes
+        if dht_nodes <= 25:
+            if dht_nodes >= 5 and retries_left > 0:
+                self._logger.info(u"No enough DHT nodes %s, will try again", lt_session.status().dht_nodes)
+                self._schedule_next_check(5, retries_left - 1)
             else:
+                self._logger.info(u"No enough DHT nodes %s, will restart DHT", lt_session.status().dht_nodes)
+                threads.deferToThread(lt_session.start_dht)
                 self._schedule_next_check(10, 1)
-
-        self.trsession.lm.threadpool.call(0, do_dht_check)
+        else:
+            self._logger.info("dht is working enough nodes are found (%d)", self.get_session().status().dht_nodes)
+            self.dht_ready = True
 
     def _map_call_on_ltsessions(self, hops, funcname, *args, **kwargs):
         if hops is None:
@@ -502,37 +508,38 @@ class LibtorrentMgr(TaskManager):
         else:
             getattr(self.get_session(hops), funcname)(*args, **kwargs)
 
-    def start_download_from_uri(self, uri):
+    def start_download_from_uri(self, uri, dconfig=None):
         if uri.startswith("http"):
-            return self.start_download_from_url(uri)
+            return self.start_download_from_url(uri, dconfig=dconfig)
         if uri.startswith("magnet:"):
-            return self.start_download_from_magnet(uri)
+            return succeed(self.start_download_from_magnet(uri, dconfig=dconfig))
         if uri.startswith("file:"):
             argument = url2pathname(uri[5:])
-            return self.start_download(torrentfilename=argument)
+            return succeed(self.start_download(torrentfilename=argument, dconfig=dconfig))
 
-        return None
+        return fail(Failure(Exception("invalid uri")))
 
-    def start_download_from_url(self, url):
-        try:
-            tdef = TorrentDef.load_from_url(url)
-            if tdef:
-                return self.start_download(tdef=tdef)
-        except:
-            return None
+    @blocking_call_on_reactor_thread
+    def start_download_from_url(self, url, dconfig=None):
 
-    def start_download_from_magnet(self, url):
+        def _on_loaded(tdef):
+            return self.start_download(torrentfilename=None, infohash=None, tdef=tdef, dconfig=dconfig)
+
+        deferred = TorrentDef.load_from_url(url)
+        deferred.addCallback(_on_loaded)
+        return deferred
+
+    def start_download_from_magnet(self, url, dconfig=None):
         name, infohash, _ = parse_magnetlink(url)
         if name is None:
             name = ""
         if infohash is None:
             raise RuntimeError("Missing infohash")
         tdef = TorrentDefNoMetainfo(infohash, name, url=url)
-        return self.start_download(tdef=tdef)
+        return self.start_download(tdef=tdef, dconfig=dconfig)
 
-    def start_download(self, torrentfilename=None, destdir=None, infohash=None, tdef=None):
-        self._logger.debug(u"starting download: filename: %s, dest dir: %s, torrent def: %s",
-                           torrentfilename, destdir, tdef)
+    def start_download(self, torrentfilename=None, infohash=None, tdef=None, dconfig=None):
+        self._logger.debug(u"starting download: filename: %s, torrent def: %s", torrentfilename, tdef)
 
         if infohash is not None:
             assert isinstance(infohash, str), "infohash type: %s" % type(infohash)
@@ -570,16 +577,11 @@ class LibtorrentMgr(TaskManager):
                 self.trsession.update_trackers(tdef.get_infohash(), new_trackers)
             return
 
-        defaultDLConfig = DefaultDownloadStartupConfig.getInstance()
-        dscfg = defaultDLConfig.copy()
+        default_dl_config = DefaultDownloadStartupConfig.getInstance()
+        dscfg = default_dl_config.copy()
 
-        # TODO martijn: for now, we are always using the default settings, which means that we bypass
-        # the screen to select torrent files/adjust the anonymity level.
-        dscfg.set_hops(0) # TODO martijn: hard-coded for now
-        dscfg.set_safe_seeding(False) # TODO martijn: hard-coded for now
-
-        if destdir is not None:
-            dscfg.set_dest_dir(destdir)
+        if dconfig is not None:
+            dscfg = dconfig
 
         self._logger.info('start_download: Starting in VOD mode')
         result = self.trsession.start_download_from_tdef(tdef, dscfg)

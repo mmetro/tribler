@@ -6,17 +6,15 @@ import os
 import logging
 from hashlib import sha1
 from types import StringType, ListType, IntType, LongType
-from requests.exceptions import InvalidSchema
 from libtorrent import bencode, bdecode
-import requests
 
 from Tribler.Core.simpledefs import INFOHASH_LENGTH
 from Tribler.Core.defaults import TDEF_DEFAULTS
 from Tribler.Core.exceptions import TorrentDefNotFinalizedException, NotYetImplementedException
-import Tribler.Core.APIImplementation.maketorrent as maketorrent
-
-from Tribler.Core.Utilities.utilities import validTorrentFile, isValidURL, parse_magnetlink
+from Tribler.Core.Utilities import maketorrent
+from Tribler.Core.Utilities.utilities import validTorrentFile, isValidURL, parse_magnetlink, http_get
 from Tribler.Core.Utilities.unicode import dunno2unicode
+from Tribler.dispersy.util import blocking_call_on_reactor_thread
 
 
 class TorrentDef(object):
@@ -63,6 +61,22 @@ class TorrentDef(object):
         # a Session. Alternatively, the tracker will be set to the internal
         # tracker by default when Session::start_download() is called, if the
         # 'announce' field is the empty string.
+
+    def __eq__(self, other):
+        return (isinstance(other, TorrentDef) and
+                self.metainfo_valid == other.metainfo_valid and
+                self.input == other.input and
+                self.infohash == other.infohash and
+                self.metainfo == other.metainfo)
+
+    def __str__(self):
+        return str({
+            "metainfo_valid": self.metainfo_valid,
+            "input": self.input,
+            "infohash": self.infohash,
+            "metainfo": self.metainfo
+        })
+
     #
     # Class methods for creating a TorrentDef from a .torrent file
     #
@@ -120,25 +134,22 @@ class TorrentDef(object):
     _create = staticmethod(_create)
 
     @staticmethod
+    @blocking_call_on_reactor_thread
     def load_from_url(url):
         """
-        If the URL starts with 'http:' load a BT .torrent or Tribler .tstream
-        file from the URL and convert it into a TorrentDef. If the URL starts
-        with our URL scheme, we convert the URL to a URL-compatible TorrentDef.
-
-        If we can't download the .torrent file, this method returns None.
+        Load a BT .torrent or Tribler .tstream file from the URL and
+        convert it into a TorrentDef.
 
         @param url URL
-        @return TorrentDef.
+        @return Deferred
         """
         # Class method, no locking required
-        try:
-            response = requests.get(url, timeout=30, verify=False)
-            if response.ok:
-                return TorrentDef.load_from_memory(response.content)
+        def _on_response(data):
+            return TorrentDef.load_from_memory(data)
 
-        except InvalidSchema:
-            pass
+        deferred = http_get(url)
+        deferred.addCallback(_on_response)
+        return deferred
 
     @staticmethod
     def load_from_dict(metainfo):
@@ -234,7 +245,7 @@ class TorrentDef(object):
 
     def set_tracker_hierarchy(self, hier):
         """ Set hierarchy of trackers (announce-list) following the spec
-        at http://www.bittornado.com/docs/multitracker-spec.txt
+        at http://www.bittorrent.org/beps/bep_0012.html
         @param hier A hierarchy of trackers as a list of lists.
         """
         # TODO: check input, in particular remove / at end
@@ -253,6 +264,10 @@ class TorrentDef(object):
                 if url.endswith('/'):
                     # Some tracker code can't deal with / at end
                     url = url[:-1]
+
+                if self.get_tracker() is None:
+                    # Backwards compatibility Multitracker Metadata Extension
+                    self.set_tracker(url)
                 newtier.append(url)
             newhier.append(newtier)
 
@@ -755,6 +770,12 @@ class TorrentDef(object):
 
 
 class TorrentDefNoMetainfo(object):
+    """
+    Instances of this class are used when working with a torrent def that contains no metainfo (yet), for instance,
+    when starting a download with only an infohash. Other methods that are using this class do not distinguish between
+    a TorrentDef with and without data and may still expect this class to have various methods in TorrentDef
+    implemented.
+    """
 
     def __init__(self, infohash, name, url=None):
         assert isinstance(infohash, str), "INFOHASH has invalid type: %s" % type(infohash)
@@ -788,6 +809,9 @@ class TorrentDefNoMetainfo(object):
         return []
 
     def get_files_as_unicode(self, exts=None):
+        return []
+
+    def get_files_as_unicode_with_length(self, exts=None):
         return []
 
     def get_trackers_as_single_tuple(self):

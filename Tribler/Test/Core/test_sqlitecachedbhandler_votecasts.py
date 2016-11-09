@@ -1,3 +1,5 @@
+from twisted.internet.defer import inlineCallbacks
+
 from Tribler.Core.CacheDB.SqliteCacheDBHandler import VoteCastDBHandler, ChannelCastDBHandler
 from Tribler.Test.Core.test_sqlitecachedbhandler import AbstractDB
 from Tribler.dispersy.util import blocking_call_on_reactor_thread
@@ -5,14 +7,15 @@ from Tribler.dispersy.util import blocking_call_on_reactor_thread
 
 class TestVotecastDBHandler(AbstractDB):
 
+    @blocking_call_on_reactor_thread
+    @inlineCallbacks
     def setUp(self):
-        super(TestVotecastDBHandler, self).setUp()
+        yield super(TestVotecastDBHandler, self).setUp()
 
         self.cdb = ChannelCastDBHandler(self.session)
         self.vdb = VoteCastDBHandler(self.session)
         self.vdb.channelcast_db = self.cdb
 
-    @blocking_call_on_reactor_thread
     def tearDown(self):
         self.cdb.close()
         self.cdb = None

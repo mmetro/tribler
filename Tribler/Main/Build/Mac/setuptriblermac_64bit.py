@@ -215,17 +215,16 @@ setup(
     options={'py2app': {
         'argv_emulation': True,
         'includes': includeModules,
-        'excludes': ["Tkinter", "Tkconstants", "tcl"],
+        'excludes': ["Tkinter", "Tkconstants", "tcl", "PyQt5"],
         'iconfile': LIBRARYNAME + '/Main/Build/Mac/tribler.icns',
         'plist': Plist.fromFile(LIBRARYNAME + '/Main/Build/Mac/Info.plist'),
         'optimize': 0 if __debug__ else 2,
         'resources':
-            [(LIBRARYNAME + "/Category", [LIBRARYNAME + "/Category/category.conf"]),
+            [(LIBRARYNAME + "/Core/Category", [LIBRARYNAME + "/Core/Category/category.conf"]),
              (LIBRARYNAME + "/Core/DecentralizedTracking/pymdht/core",
               [LIBRARYNAME + "/Core/DecentralizedTracking/pymdht/core/bootstrap_stable"]),
              (LIBRARYNAME + "/Core/DecentralizedTracking/pymdht/core",
               [LIBRARYNAME + "/Core/DecentralizedTracking/pymdht/core/bootstrap_unstable"]),
-             LIBRARYNAME + "/readme.txt",
              LIBRARYNAME + "/Main/Build/Mac/TriblerDoc.icns",
              ]
             + ["/Users/tribler/Documents/workspace/install/libsodium.dylib"]

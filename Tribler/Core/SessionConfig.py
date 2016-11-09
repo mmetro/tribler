@@ -23,6 +23,9 @@ from Tribler.Core.Utilities.network_utils import autodetect_socket_style, get_ra
 from Tribler.Core.defaults import sessdefaults
 from Tribler.Core.osutils import get_appstate_dir, is_android
 from Tribler.Core.simpledefs import STATEDIR_SESSCONFIG
+from Tribler.Policies.BoostingPolicy import CreationDatePolicy, BoostingPolicy
+from Tribler.Policies.BoostingPolicy import RandomPolicy
+from Tribler.Policies.BoostingPolicy import SeederRatioPolicy
 
 
 class SessionConfigInterface(object):
@@ -56,12 +59,14 @@ class SessionConfigInterface(object):
         if not sessconfig:
             return
 
-        # TODO(emilon): This is to work around the case where windows has
-        # non-ASCI chars on %PATH% contents. Should be removed if we migrate to
-        # python 3.
         if sys.platform == 'win32':
+            # TODO(emilon): This is to work around the case where windows has
+            # non-ASCI chars on %PATH% contents. Should be removed if we migrate to
+            # python 3.
             from Tribler.Main.hacks import get_environment_variable
             path_env = get_environment_variable(u"PATH")
+        elif is_android():
+            path_env = unicode(os.environ["PYTHONPATH"])
         else:
             path_env = os.environ["PATH"]
 
@@ -70,7 +75,7 @@ class SessionConfigInterface(object):
             ffmpegname = u"ffmpeg.exe"
         elif sys.platform == 'darwin':
             ffmpegname = u"ffmpeg"
-        elif find_executable("avconv"):
+        elif find_executable("avconv", path_env):
             ffmpegname = u"avconv"
         else:
             ffmpegname = u"ffmpeg"
@@ -80,13 +85,10 @@ class SessionConfigInterface(object):
         if ffmpegpath is None:
             if sys.platform == 'darwin':
                 self.sessconfig.set(u'general', u'videoanalyserpath', u"vlc/ffmpeg")
-            elif is_android(strict=True):
-                self.sessconfig.set(u'general', u'videoanalyserpath', os.path.join(
-                    os.environ['ANDROID_PRIVATE'], 'ffmpeg'))
             else:
-                self.sessconfig.set(u'general', u'videoanalyserpath', ffmpegname)
+                self.sessconfig.set(u'general', u'videoanalyserpath', os.path.abspath(ffmpegname))
         else:
-            self.sessconfig.set(u'general', u'videoanalyserpath', ffmpegpath)
+            self.sessconfig.set(u'general', u'videoanalyserpath', os.path.abspath(ffmpegpath))
 
         # Set videoplayer path
         if sys.platform == 'win32':
@@ -186,6 +188,27 @@ class SessionConfigInterface(object):
             self.set_permid_keypair_filename(file_name)
         return file_name
 
+    def set_multichain_permid_keypair_filename(self, keypairfilename):
+        """ Set the filename containing the Elliptic Curve keypair to use for
+        PermID-based authentication for multichain in this Session.
+
+        Note: if a Session is started with a SessionStartupConfig that
+        points to an existing state dir and that state dir contains a saved
+        keypair, that keypair will be used unless a different keypair is
+        explicitly configured via this method.
+        """
+        self.sessconfig.set(u'general', u'ec_keypair_filename_multichain', keypairfilename)
+
+    def get_multichain_permid_keypair_filename(self):
+        """ Returns the filename of the Session's multichain keypair.
+        @return An absolute path name. """
+        file_name = self.sessconfig.get(u'general', u'ec_keypair_filename_multichain')
+        if not file_name:
+            file_name = os.path.join(self.get_state_dir(), 'ec_multichain.pem')
+            self.set_multichain_permid_keypair_filename(file_name)
+        return file_name
+
+
     def set_listen_port(self, port):
         """ Set the UDP and TCP listen port for this Session.
         @param port A port number.
@@ -198,6 +221,10 @@ class SessionConfigInterface(object):
         @param port A port number.
         """
         self.selected_ports['~'.join(('general', 'minport'))] = port
+
+    #
+    # Tunnel Community settings
+    #
 
     def set_tunnel_community_socks5_listen_ports(self, ports):
         self.sessconfig.set(u'tunnel_community', u'socks5_listen_ports', ports)
@@ -214,6 +241,20 @@ class SessionConfigInterface(object):
         """ Returns whether being an exitnode is allowed
         @return Boolean. """
         return self.sessconfig.get(u'tunnel_community', u'exitnode_enabled')
+
+    def set_tunnel_community_enabled(self, value):
+        """
+        Enable or disable the tunnel community.
+        :param value: A boolean indicating whether the tunnel community should be enabled
+        """
+        self.sessconfig.set(u'tunnel_community', u'enabled', value)
+
+    def get_tunnel_community_enabled(self):
+        """
+        Returns whether the tunnel community is enabled.
+        :return: A boolean indicating whether the tunnel community is enabled
+        """
+        return self.sessconfig.get(u'tunnel_community', u'enabled')
 
     #
     # BarterCommunity settings
@@ -571,13 +612,13 @@ class SessionConfigInterface(object):
     #
     # Config for swift tunneling e.g. dispersy traffic
     #
-    def get_videoplayer(self):
+    def get_videoserver_enabled(self):
         """ Enable or disable VOD functionality (default = True).
         @param value Boolean.
         """
         return self.sessconfig.get(u'video', u'enabled')
 
-    def set_videoplayer(self, value):
+    def set_videoserver_enabled(self, value):
         """ Returns whether VOD functionality is enabled.
         @return Boolean.
         """
@@ -595,13 +636,13 @@ class SessionConfigInterface(object):
         """
         self.sessconfig.set(u'video', u'path', path)
 
-    def get_videoplayer_port(self):
+    def get_videoserver_port(self):
         """ Get the port number that the video http server should use.
         @return integer.
         """
         return self._obtain_port(u'video', u'port')
 
-    def set_videoplayer_port(self, port):
+    def set_videoserver_port(self, port):
         """ Set the port number that the video http server should use.
         @param port integer (-1 indicates a random port).
         """
@@ -619,6 +660,10 @@ class SessionConfigInterface(object):
         """
         self.sessconfig.set(u'video', u'preferredmode', mode)
 
+    #
+    # Search Community
+    #
+
     def get_enable_torrent_search(self):
         """ Gets if to enable torrent search (SearchCommunity).
         :return: True or False.
@@ -631,6 +676,10 @@ class SessionConfigInterface(object):
         """
         self.sessconfig.set(u'search_community', u'enabled', mode)
 
+    #
+    # AllChannel Community
+    #
+
     def get_enable_channel_search(self):
         """ Gets if to enable torrent search (AllChannelCommunity).
         :return: True or False.
@@ -642,6 +691,42 @@ class SessionConfigInterface(object):
         :param mode: True or False.
         """
         self.sessconfig.set(u'allchannel_community', u'enabled', mode)
+
+    #
+    # Channel Community
+    #
+
+    def set_channel_community_enabled(self, value):
+        """
+        Enable or disable the channel community.
+        :param value: A boolean indicating whether the channel community should be enabled
+        """
+        self.sessconfig.set(u'channel_community', u'enabled', value)
+
+    def get_channel_community_enabled(self):
+        """
+        Returns whether the channel community is enabled.
+        :return: A boolean indicating whether the channel community is enabled
+        """
+        return self.sessconfig.get(u'channel_community', u'enabled')
+
+    #
+    # PreviewChannel Community
+    #
+
+    def set_preview_channel_community_enabled(self, value):
+        """
+        Enable or disable the preview channel community.
+        :param value: A boolean indicating whether the preview channel community should be enabled
+        """
+        self.sessconfig.set(u'preview_channel_community', u'enabled', value)
+
+    def get_preview_channel_community_enabled(self):
+        """
+        Returns whether the preview channel community is enabled.
+        :return: A boolean indicating whether the preview channel community is enabled
+        """
+        return self.sessconfig.get(u'preview_channel_community', u'enabled')
 
     def get_enable_metadata(self):
         """
@@ -671,6 +756,21 @@ class SessionConfigInterface(object):
         """
         return self.sessconfig.set(u'metadata', u'store_dir', value)
 
+    def set_enable_multichain(self, value):
+        """
+        Sets if to enable MultiChain
+        :param value: True of False
+        """
+        self.sessconfig.set(u'multichain', u'enabled', value)
+
+    def get_enable_multichain(self):
+        """
+        Gets if to enable MultiChain.
+        :return: (bool) True or False
+        """
+        return self.sessconfig.get(u'multichain', u'enabled')
+
+
     def set_upgrader_enabled(self, should_upgrade):
         """
         Sets if to enable upgrading.
@@ -684,6 +784,221 @@ class SessionConfigInterface(object):
         :return: A boolean indicating if upgrading is enabled.
         """
         return self.sessconfig.get(u'upgrader', u'enabled')
+
+    #
+    # Watch folder
+    #
+    def set_watch_folder_enabled(self, watch_folder_enabled):
+        """
+        Sets if the watch folder is enabled.
+        :param watch_folder_enabled: True or False.
+        """
+        return self.sessconfig.set(u'watch_folder', u'enabled', watch_folder_enabled)
+
+    def get_watch_folder_enabled(self):
+        """
+        Returns if the watch folder is enabled.
+        :return: A boolean indicating if the watch folder is enabled.
+        """
+        return self.sessconfig.get(u'watch_folder', u'enabled')
+
+    def set_watch_folder_path(self, value):
+        """ Set the location of the watch folder
+        @param value An absolute path.
+        """
+        self.sessconfig.set(u'watch_folder', u'watch_folder_dir', value)
+
+    def get_watch_folder_path(self):
+        """ Get the path to the watch folder directory.
+        @return An absolute path.
+        """
+        return self.sessconfig.get(u'watch_folder', u'watch_folder_dir')
+
+    #
+    # API
+    #
+    def set_http_api_enabled(self, http_api_enabled):
+        """
+        Sets whether the HTTP API is enabled.
+        :param http_api_enabled: True or False.
+        """
+        return self.sessconfig.set(u'http_api', u'enabled', http_api_enabled)
+
+    def get_http_api_enabled(self):
+        """
+        Returns whether the HTTP API is enabled.
+        :return: A boolean indicating whether the HTTP API is enabled.
+        """
+        return self.sessconfig.get(u'http_api', u'enabled')
+
+    def set_http_api_port(self, http_api_port):
+        """
+        Sets the HTTP API listen port.
+        :param http_api_port: An integer, indicating the port where the HTTP API should listen on.
+        """
+        return self.sessconfig.set(u'http_api', u'port', http_api_port)
+
+    def get_http_api_port(self):
+        """
+        Returns the HTTP API listen port.
+        :return: An integer indicating the port where the HTPT API listens on.
+        """
+        return self._obtain_port(u'http_api', u'port')
+
+    #
+    # Credit Mining
+    #
+
+    def set_creditmining_enable(self, value):
+        """
+        Sets to enable credit mining
+        """
+        self.sessconfig.set(u'credit_mining', u'enabled', value)
+
+    def get_creditmining_enable(self):
+        """
+        Gets if credit mining is enabled
+        :return: (bool) True or False
+        """
+        return self.sessconfig.get(u'credit_mining', u'enabled')
+
+    def set_cm_max_torrents_active(self, max_torrents_active):
+        """
+        Set credit mining max active torrents in a single session
+        """
+        return self.sessconfig.set(u'credit_mining', u'max_torrents_active', max_torrents_active)
+
+    def get_cm_max_torrents_active(self):
+        """
+        get max number of torrents active in a single session
+        """
+        return self.sessconfig.get(u'credit_mining', u'max_torrents_active')
+
+    def set_cm_max_torrents_per_source(self, max_torrents_per_source):
+        """
+        set a number of torrent that can be stored in a single source
+        """
+        return self.sessconfig.set(u'credit_mining', u'max_torrents_per_source', max_torrents_per_source)
+
+    def get_cm_max_torrents_per_source(self):
+        """
+        get max number of torrent that can be stored in a single source
+        """
+        return self.sessconfig.get(u'credit_mining', u'max_torrents_per_source')
+
+    def set_cm_source_interval(self, source_interval):
+        """
+        set interval of looking up new torrent in a swarm
+        """
+        return self.sessconfig.set(u'credit_mining', u'source_interval', source_interval)
+
+    def get_cm_source_interval(self):
+        """
+        get interval of looking up new torrent in a swarm
+        """
+        return self.sessconfig.get(u'credit_mining', u'source_interval')
+
+    def set_cm_swarm_interval(self, swarm_interval):
+        """
+        set the interval of choosing activity which swarm will be downloaded
+        """
+        return self.sessconfig.set(u'credit_mining', u'swarm_interval', swarm_interval)
+
+    def get_cm_swarm_interval(self):
+        """
+        getting the interval of choosing activity which swarm will be downloaded
+        """
+        return self.sessconfig.get(u'credit_mining', u'swarm_interval')
+
+    def set_cm_tracker_interval(self, tracker_interval):
+        """
+        set the manual (force) scraping interval.
+        """
+        return self.sessconfig.set(u'credit_mining', u'tracker_interval', tracker_interval)
+
+    def get_cm_tracker_interval(self):
+        """
+        get the manual (force) scraping interval.
+        """
+        return self.sessconfig.get(u'credit_mining', u'tracker_interval')
+
+    def set_cm_logging_interval(self, logging_interval):
+        """
+        set the credit mining logging interval (INFO,DEBUG)
+        """
+        return self.sessconfig.set(u'credit_mining', u'logging_interval', logging_interval)
+
+    def get_cm_logging_interval(self):
+        """
+        get the credit mining logging interval (INFO,DEBUG)
+        """
+        return self.sessconfig.get(u'credit_mining', u'logging_interval')
+
+    def set_cm_share_mode_target(self, share_mode_target):
+        """
+        set the share mode target in credit mining. Value can be referenced at :
+        http://www.libtorrent.org/reference-Settings.html#share_mode_target
+        """
+        return self.sessconfig.set(u'credit_mining', u'share_mode_target', share_mode_target)
+
+    def get_cm_share_mode_target(self):
+        """
+        get the current share mode target that applies in all the swarm
+        """
+        return self.sessconfig.get(u'credit_mining', u'share_mode_target')
+
+    def set_cm_policy(self, policy_str):
+        """
+        set the credit mining policy. Input can be policy name or class
+        """
+        switch_policy = {
+            RandomPolicy: "random",
+            CreationDatePolicy: "creation",
+            SeederRatioPolicy: "seederratio"
+        }
+
+        if isinstance(policy_str, BoostingPolicy):
+            policy_str = switch_policy[type(policy_str)]
+
+        return self.sessconfig.set(u'credit_mining', u'policy', policy_str)
+
+    def get_cm_policy(self, as_class=False):
+        """
+        get the credit mining policy. If as_class True, will return as class,
+        otherwise will return as policy name (str)
+        """
+        policy_str = self.sessconfig.get(u'credit_mining', u'policy')
+
+        if as_class:
+            switch_policy = {
+                "random": RandomPolicy,
+                "creation": CreationDatePolicy,
+                "seederratio": SeederRatioPolicy
+            }
+
+            ret = switch_policy[policy_str]
+        else:
+            ret = policy_str
+
+        return ret
+
+    def set_cm_sources(self, source_list, key):
+        """
+        set source list for a chosen key :
+        boosting_sources, boosting_enabled, boosting_disabled, or archive_sources
+        """
+        return self.sessconfig.set(u'credit_mining', u'%s' % key, source_list)
+
+    def get_cm_sources(self):
+        """
+        get all the lists as list of string in the configuration
+        """
+        ret = {"boosting_sources": self.sessconfig.get(u'credit_mining', u'boosting_sources'),
+               "boosting_enabled": self.sessconfig.get(u'credit_mining', u'boosting_enabled'),
+               "boosting_disabled": self.sessconfig.get(u'credit_mining', u'boosting_disabled'),
+               "archive_sources": self.sessconfig.get(u'credit_mining', u'archive_sources')}
+
+        return ret
 
     #
     # Static methods

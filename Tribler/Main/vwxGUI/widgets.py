@@ -13,7 +13,6 @@ from Tribler.Main.vwxGUI import (TRIBLER_RED, LIST_HIGHTLIGHT, GRADIENT_LRED, GR
                                  STOPPED_COLOUR)
 from Tribler.Main.vwxGUI.GuiUtility import GUIUtility
 from Tribler.Main.vwxGUI.GuiImageManager import GuiImageManager
-from Tribler.Main.vwxGUI.UserDownloadChoice import UserDownloadChoice
 from Tribler.Core.simpledefs import DLMODE_VOD
 
 
@@ -235,7 +234,7 @@ class LinkStaticText(wx.BoxSizer):
 
         selectedfont = parent.GetFont()
         selectedfont.SetPointSize(normalfont.GetPointSize() + font_increment)
-        selectedfont.SetUnderlined(True)
+        #selectedfont.SetUnderlined(True)
 
         self.text = LinkText(parent, text, fonts=[normalfont, selectedfont], colours=[
                              font_colour, (255, 0, 0, 255)], parentsizer=self)
@@ -1773,14 +1772,17 @@ class TagText(wx.Panel):
             dc.DrawBitmap(sub, 0, 0)
 
         # Draw the rounded rectangle which will contain the text.
-        gc = wx.GraphicsContext.Create(dc)
+        widget_radius = 5
         x, y, width, height = self.GetClientRect()
-        gc.SetBrush(wx.Brush(self.fill_colour))
-        gc.SetPen(wx.Pen(self.edge_colour, 1, wx.SOLID))
-        path = gc.CreatePath()
-        path.AddRoundedRectangle(x, y, width - 1, height - 1, 5)
-        path.CloseSubpath()
-        gc.DrawPath(path)
+        # Only add rounded corners when we have enough space for it
+        if width >= widget_radius * 2 and height >= widget_radius * 2:
+            graphics_context = wx.GraphicsContext.Create(dc)
+            graphics_context.SetBrush(wx.Brush(self.fill_colour))
+            graphics_context.SetPen(wx.Pen(self.edge_colour, 1, wx.SOLID))
+            path = graphics_context.CreatePath()
+            path.AddRoundedRectangle(x, y, width - 1, height - 1, widget_radius)
+            path.CloseSubpath()
+            graphics_context.DrawPath(path)
 
         # Draw the text
         font = self.GetFont()
@@ -1848,7 +1850,8 @@ class TorrentStatus(wx.Panel):
             status = 'Fetching torrent'
         elif 'seeding' in torrent_state:
             status = 'Seeding'
-            if torrent.ds and UserDownloadChoice.get_singleton().get_download_state(torrent.ds.get_download().get_def().get_infohash()) == 'restartseed':
+            tribler_config = GUIUtility.getInstance().utility.session.tribler_config
+            if torrent.ds and tribler_config.get_download_state(torrent.ds.get_download().get_def().get_infohash()) == 'restartseed':
                 status = "[F] " + status
         elif finished:
             status = 'Completed'

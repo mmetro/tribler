@@ -1,16 +1,17 @@
 # Written by Egbert Bouman
 
 import random
-import socket
 import time
 from collections import defaultdict
 from cryptography.exceptions import InvalidTag
 
 from twisted.internet import reactor
+from twisted.internet.defer import maybeDeferred, succeed, inlineCallbacks, returnValue
+from twisted.internet.error import MessageLengthError
 from twisted.internet.protocol import DatagramProtocol
 from twisted.internet.task import LoopingCall
+from twisted.python.threadable import isInIOThread
 
-from Tribler import dispersy
 from Tribler.Core.Utilities.encoding import decode, encode
 from Tribler.community.bartercast4.statistics import BartercastStatisticTypes, _barter_statistics
 from Tribler.community.tunnel import (CIRCUIT_ID_PORT, CIRCUIT_STATE_EXTENDING, CIRCUIT_STATE_READY, CIRCUIT_TYPE_DATA,
@@ -34,8 +35,10 @@ from Tribler.dispersy.endpoint import TUNNEL_PREFIX_LENGHT
 from Tribler.dispersy.message import DropMessage, Message
 from Tribler.dispersy.requestcache import NumberCache, RandomNumberCache
 from Tribler.dispersy.resolution import PublicResolution
+from Tribler.dispersy.taskmanager import TaskManager
 from Tribler.dispersy.util import call_on_reactor_thread
 import logging
+
 
 class CircuitRequestCache(NumberCache):
 
@@ -108,10 +111,11 @@ class StatsRequestCache(RandomNumberCache):
         pass
 
 
-class TunnelExitSocket(DatagramProtocol):
+class TunnelExitSocket(DatagramProtocol, TaskManager):
 
     def __init__(self, circuit_id, community, sock_addr, mid=None):
-        self.tunnel_logger = logging.getLogger('TunnelLogger')
+        self.tunnel_logger = logging.getLogger(self.__class__.__name__)
+        super(TunnelExitSocket, self).__init__()
 
         self.port = None
         self.sock_addr = sock_addr
@@ -133,26 +137,23 @@ class TunnelExitSocket(DatagramProtocol):
     def sendto(self, data, destination):
         if self.check_num_packets(destination, False):
             if TunnelConversion.is_allowed(data):
-                if dispersy.util.is_valid_address(destination):
-                    ip_address = destination[0]
-                else:
+                def on_error(failure):
+                    self.tunnel_logger.error("Can't resolve ip address for hostname %s. Failure: %s",
+                                             destination[0], failure)
+
+                def on_ip_address(ip_address):
+                    self.tunnel_logger.debug("Resolved hostname %s to ip_address %s", destination[0], ip_address)
                     try:
-                        ip_address = socket.gethostbyname(destination[0])
-                        self.tunnel_logger.info("Resolved ip address %s for hostname %s",
-                                                 ip_address,
-                                                 destination[0])
-                    except:
-                        self.tunnel_logger.error("Can't resolve ip address for hostname %s", destination[0])
+                        self.transport.write(data, (ip_address, destination[1]))
+                        self.community.increase_bytes_sent(self, len(data))
+                    except (AttributeError, MessageLengthError) as exception:
+                        self.tunnel_logger.error(
+                            "Failed to write data to transport: %s. Destination: %r error was: %r",
+                            exception, destination, exception)
 
-                try:
-                    self.transport.write(data, (ip_address, destination[1]))
-                except Exception, e:
-                    self.tunnel_logger.error("Failed to write data to transport: %s. Destination: %s",
-                                             e[1],
-                                             repr(destination))
-                    raise
-
-                self.community.increase_bytes_sent(self, len(data))
+                resolve_ip_address_deferred = reactor.resolve(destination[0])
+                resolve_ip_address_deferred.addCallbacks(on_ip_address, on_error)
+                self.register_task("resolving_%r" % destination[0], resolve_ip_address_deferred)
             else:
                 self.tunnel_logger.error("dropping forbidden packets from exit socket with circuit_id %d",
                                          self.circuit_id)
@@ -170,10 +171,23 @@ class TunnelExitSocket(DatagramProtocol):
         self.tunnel_logger.debug("Tunnel data to origin %s for circuit %s", ('0.0.0.0', 0), self.circuit_id)
         self.community.send_data([Candidate(self.sock_addr, False)], self.circuit_id, ('0.0.0.0', 0), source, data)
 
+    @inlineCallbacks
     def close(self):
+        """
+        Closes the UDP socket if enabled and cancels all pending deferreds.
+        :return: A deferred that fires once the UDP socket has closed.
+        """
+        assert isInIOThread()
+        # The resolution deferreds can't be cancelled, so we need to wait for
+        # them to finish.
+        yield self.wait_for_deferred_tasks()
+        self.cancel_all_pending_tasks()
+        done_closing_deferred = succeed(None)
         if self.enabled:
-            self.port.stopListening()
+            done_closing_deferred = maybeDeferred(self.port.stopListening)
             self.port = None
+        res = yield done_closing_deferred
+        returnValue(res)
 
     def check_num_packets(self, ip, incoming):
         if self.ips[ip] < 0:
@@ -196,7 +210,7 @@ class TunnelExitSocket(DatagramProtocol):
 
 class TunnelSettings(object):
 
-    def __init__(self, install_dir=None, tribler_session=None):
+    def __init__(self, tribler_session=None):
         self.tunnel_logger = logging.getLogger('TunnelLogger')
 
         self.crypto = TunnelCrypto()
@@ -215,8 +229,10 @@ class TunnelSettings(object):
 
         if tribler_session:
             self.become_exitnode = tribler_session.get_tunnel_community_exitnode_enabled()
+            self.enable_multichain = tribler_session.get_enable_multichain()
         else:
             self.become_exitnode = False
+            self.enable_multichain = False
 
 
 class ExitCandidate(object):
@@ -374,8 +390,9 @@ class TunnelCommunity(Community):
     def initiate_conversions(self):
         return [DefaultConversion(self), TunnelConversion(self)]
 
+    @inlineCallbacks
     def unload_community(self):
-        self.socks_server.stop()
+        yield self.socks_server.stop()
 
         # Remove all circuits/relays/exitsockets
         for circuit_id in self.circuits.keys():
@@ -385,7 +402,7 @@ class TunnelCommunity(Community):
         for circuit_id in self.exit_sockets.keys():
             self.remove_exit_socket(circuit_id, 'unload', destroy=True)
 
-        super(TunnelCommunity, self).unload_community()
+        yield super(TunnelCommunity, self).unload_community()
 
     @property
     def crypto(self):
@@ -530,7 +547,7 @@ class TunnelCommunity(Community):
         circuit.unverified_hop.address = first_hop.sock_addr
         circuit.unverified_hop.dh_secret, circuit.unverified_hop.dh_first_part = self.crypto.generate_diffie_secret()
 
-        self.tunnel_logger.error("creating circuit %d of %d hops. First hop: %s:%d", circuit_id, circuit.goal_hops,
+        self.tunnel_logger.info("creating circuit %d of %d hops. First hop: %s:%d", circuit_id, circuit.goal_hops,
                            first_hop.sock_addr[0], first_hop.sock_addr[1])
 
         self.circuits[circuit_id] = circuit
@@ -556,6 +573,8 @@ class TunnelCommunity(Community):
     def remove_circuit(self, circuit_id, additional_info='', destroy=False):
         assert isinstance(circuit_id, (long, int)), type(circuit_id)
 
+        self.tunnel_logger.info("MULTICHAIN: Removing circuit")
+
         if circuit_id in self.circuits:
             self.tunnel_logger.info("removing circuit %d " + additional_info, circuit_id)
 
@@ -563,6 +582,14 @@ class TunnelCommunity(Community):
                 self.destroy_circuit(circuit_id)
 
             circuit = self.circuits.pop(circuit_id)
+            if self.notifier:
+                peer = (circuit.first_hop[0], circuit.first_hop[1])
+                candidate = self.get_candidate(peer)
+                if candidate:
+                    from Tribler.Core.simpledefs import NTFY_TUNNEL, NTFY_REMOVE
+                    self.notifier.notify(NTFY_TUNNEL, NTFY_REMOVE, circuit, candidate)
+                else:
+                    self.tunnel_logger.warning("MULTICHAIN: Tunnel candidate not found")
             circuit.destroy()
 
             affected_peers = self.socks_server.circuit_dead(circuit)
@@ -586,6 +613,9 @@ class TunnelCommunity(Community):
         return False
 
     def remove_relay(self, circuit_id, additional_info='', destroy=False, got_destroy_from=None, both_sides=True):
+
+        self.tunnel_logger.info("MULTICHAIN: Removing relay")
+
         # Find other side of relay
         to_remove = [circuit_id]
         if both_sides:
@@ -601,7 +631,15 @@ class TunnelCommunity(Community):
             if cid in self.relay_from_to:
                 self.tunnel_logger.warning("Removing relay %d %s", cid, additional_info)
                 # Remove the relay
-                del self.relay_from_to[cid]
+                relay = self.relay_from_to.pop(cid)
+                if self.notifier:
+                    peer = (relay.sock_addr[0], relay.sock_addr[1])
+                    candidate = self.get_candidate(peer)
+                    if candidate:
+                        from Tribler.Core.simpledefs import NTFY_TUNNEL, NTFY_REMOVE
+                        self.notifier.notify(NTFY_TUNNEL, NTFY_REMOVE, relay, candidate)
+                    else:
+                        self.tunnel_logger.warning("MULTICHAIN: Tunnel candidate not found")
                 # Remove old session key
                 if cid in self.relay_session_keys:
                     del self.relay_session_keys[cid]
@@ -609,18 +647,33 @@ class TunnelCommunity(Community):
                 self.tunnel_logger.error("Could not remove relay %d %s", circuit_id, additional_info)
 
     def remove_exit_socket(self, circuit_id, additional_info='', destroy=False):
+
+        self.tunnel_logger.info("MULTICHAIN: Removing exit socket")
+
         if circuit_id in self.exit_sockets:
             if destroy:
                 self.destroy_exit_socket(circuit_id)
 
             # Close socket
             exit_socket = self.exit_sockets.pop(circuit_id)
+            if self.notifier:
+                peer = (exit_socket.sock_addr[0], exit_socket.sock_addr[1])
+                candidate = self.get_candidate(peer)
+                if candidate:
+                    from Tribler.Core.simpledefs import NTFY_TUNNEL, NTFY_REMOVE
+                    self.notifier.notify(NTFY_TUNNEL, NTFY_REMOVE, exit_socket, candidate)
+                else:
+                    self.tunnel_logger.warning("MULTICHAIN: Tunnel candidate not found")
             if exit_socket.enabled:
                 self.tunnel_logger.info("Removing exit socket %d %s", circuit_id, additional_info)
-                exit_socket.close()
-                # Remove old session key
-                if circuit_id in self.relay_session_keys:
-                    del self.relay_session_keys[circuit_id]
+
+                def on_exit_socket_closed(_):
+                    # Remove old session key
+                    if circuit_id in self.relay_session_keys:
+                        del self.relay_session_keys[circuit_id]
+
+                exit_socket.close().addCallback(on_exit_socket_closed)
+
         else:
             self.tunnel_logger.error("could not remove exit socket %d %s", circuit_id, additional_info)
 
@@ -816,12 +869,12 @@ class TunnelCommunity(Community):
 
             elif circuit_id in self.exit_sockets:
                 if cand_sock_addr != self.exit_sockets[circuit_id].sock_addr:
-                    yield DropMessage(message, "%s not allowed send destroy", cand_sock_addr)
+                    yield DropMessage(message, "%s, %s not allowed send destroy" % cand_sock_addr)
                     continue
 
             elif circuit_id in self.circuits:
                 if cand_sock_addr != self.circuits[circuit_id].first_hop:
-                    yield DropMessage(message, "%s not allowed send destroy", cand_sock_addr)
+                    yield DropMessage(message, "%s, %s not allowed send destroy" % cand_sock_addr)
                     continue
 
             else:
@@ -1073,12 +1126,11 @@ class TunnelCommunity(Community):
                                                       candidate.sock_addr, candidate_mid,
                                                       extend_candidate.sock_addr, extend_candidate_mid))
 
-
-            self.increase_bytes_sent(to_circuit_id, self.send_cell([extend_candidate],
-                                                                    u"create", (to_circuit_id,
-                                                                                message.payload.node_id,
-                                                                                message.payload.node_public_key,
-                                                                                message.payload.key)))
+            self.send_cell([extend_candidate],
+                           u"create", (to_circuit_id,
+                                       message.payload.node_id,
+                                       message.payload.node_public_key,
+                                       message.payload.key))
 
     def on_extended(self, messages):
         for message in messages:
@@ -1179,13 +1231,13 @@ class TunnelCommunity(Community):
                     self.global_time,), payload=(request.payload.identifier, stats))
                 self.send_packet([request.candidate], u"stats-response", response.packet)
             else:
-                self.tunnel_logger.error("Got stats request from unknown crawler %s", request.candidate.sock_addr)
+                self.tunnel_logger.warning("Got stats request from unknown crawler %s", request.candidate.sock_addr)
 
     def on_stats_response(self, messages):
         for message in messages:
             request = self.request_cache.get(u"stats", message.payload.identifier)
             if not request:
-                self.tunnel_logger.error("Got unexpected stats response from %s", message.candidate.sock_addr)
+                self.tunnel_logger.warning("Got unexpected stats response from %s", message.candidate.sock_addr)
                 continue
 
             request.handler(message.candidate, message.payload.stats)
@@ -1212,7 +1264,7 @@ class TunnelCommunity(Community):
             try:
                 self.exit_sockets[circuit_id].sendto(data, destination)
             except:
-                self.tunnel_logger.error("Dropping data packets while EXITing")
+                self.tunnel_logger.warning("Dropping data packets while EXITing")
         else:
             self.tunnel_logger.error("Dropping data packets with unknown circuit_id")
 
@@ -1326,6 +1378,9 @@ class TunnelCommunity(Community):
             self.stats['bytes_exit'] += num_bytes
             _barter_statistics.dict_inc_bartercast(BartercastStatisticTypes.TUNNELS_EXIT_BYTES_SENT, "%s:%s" %
                                                    (obj.sock_addr[0], obj.sock_addr[1]), num_bytes)
+        else:
+            raise TypeError("Increase_bytes_sent() was called with an object that is not a Circuit, " +
+                            "RelayRoute or TunnelExitSocket")
 
     def increase_bytes_received(self, obj, num_bytes):
         if isinstance(obj, Circuit):
@@ -1343,3 +1398,6 @@ class TunnelCommunity(Community):
             self.stats['bytes_enter'] += num_bytes
             _barter_statistics.dict_inc_bartercast(BartercastStatisticTypes.TUNNELS_EXIT_BYTES_RECEIVED, "%s:%s" %
                                                    (obj.sock_addr[0], obj.sock_addr[1]), num_bytes)
+        else:
+            raise TypeError("Increase_bytes_received() was called with an object that is not a Circuit, " +
+                            "RelayRoute or TunnelExitSocket")

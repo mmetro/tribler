@@ -13,19 +13,16 @@ import os
 import sys
 import traceback
 import logging
-import wx
-
 import subprocess
 import atexit
-
 import threading
 import time
 from traceback import print_exc, print_stack
 from urllib import url2pathname
-import copy
 
-from Tribler.Category.Category import Category
+import wx
 
+from Tribler.Core.Category.Category import Category
 from Tribler.Core.version import version_id
 from Tribler.Core.simpledefs import (NTFY_ACT_NEW_VERSION, NTFY_ACT_NONE, NTFY_ACT_ACTIVE, NTFY_ACT_UPNP,
                                      NTFY_ACT_REACHABLE, NTFY_ACT_MEET, NTFY_ACT_GET_EXT_IP_FROM_PEERS,
@@ -34,15 +31,13 @@ from Tribler.Core.simpledefs import (NTFY_ACT_NEW_VERSION, NTFY_ACT_NONE, NTFY_A
 from Tribler.Core.exceptions import DuplicateDownloadException
 from Tribler.Core.TorrentDef import TorrentDef, TorrentDefNoMetainfo
 from Tribler.Core.Utilities.utilities import parse_magnetlink, fix_torrent
-
-from Tribler.Main.globals import DefaultDownloadStartupConfig
+from Tribler.Main.Dialogs.SaveAs import SaveAs
+from Tribler.Core.DownloadConfig import DefaultDownloadStartupConfig
 from Tribler.Main.Utility.GuiDBHandler import startWorker
-
 from Tribler.Main.Dialogs.ConfirmationDialog import ConfirmationDialog
 from Tribler.Main.Dialogs.FeedbackWindow import FeedbackWindow
 from Tribler.Main.Dialogs.systray import ABCTaskBarIcon
-from Tribler.Main.Dialogs.SaveAs import SaveAs
-
+from Tribler.Main.vwxGUI.CreditMiningPanel import CreditMiningPanel
 from Tribler.Main.vwxGUI.GuiUtility import GUIUtility, forceWxThread
 from Tribler.Main.vwxGUI import DEFAULT_BACKGROUND, SEPARATOR_GREY
 from Tribler.Main.vwxGUI.list import SearchList, ChannelList, LibraryList, ActivitiesList
@@ -53,7 +48,6 @@ from Tribler.Main.vwxGUI.TopSearchPanel import TopSearchPanel
 from Tribler.Main.vwxGUI.home import Home, Stats, NetworkGraphPanel
 from Tribler.Main.vwxGUI.channel import SelectedChannelList, Playlist, ManageChannel
 from Tribler.Main.vwxGUI.SRstatusbar import SRstatusbar
-
 from Tribler.Core.Video.utils import videoextdefaults
 
 
@@ -130,7 +124,7 @@ class MainFrame(wx.Frame):
         self.params = self.guiUtility.params
         self.utility.frame = self
         self.videoframe = None
-        self.category = Category.getInstance()
+        self.category = self.utility.session.lm.category
         self.shutdown_and_upgrade_notes = None
 
         title = "Tribler %s" % version_id
@@ -193,6 +187,10 @@ class MainFrame(wx.Frame):
         self.selectedchannellist.Show(False)
         self.playlist = Playlist(self.splitter_top_window)
         self.playlist.Show(False)
+
+
+        self.creditminingpanel = CreditMiningPanel(self)
+        self.creditminingpanel.Show(False)
 
         # Populate the bottom window
         self.splitter_bottom = wx.BoxSizer(wx.HORIZONTAL)
@@ -265,6 +263,8 @@ class MainFrame(wx.Frame):
         if self.videoparentpanel:
             hSizer.Add(self.videoparentpanel, 1, wx.EXPAND)
 
+        hSizer.Add(self.creditminingpanel, 1, wx.EXPAND)
+
         self.SetSizer(vSizer)
 
         # set sizes
@@ -319,6 +319,7 @@ class MainFrame(wx.Frame):
         nextId = wx.NewId()
         prevId = wx.NewId()
         dispId = wx.NewId()
+        wxId = wx.NewId()
         anonId = wx.NewId()
         DISPERSY_DEBUG_FRAME_ID = wx.NewId()
         self.Bind(wx.EVT_MENU, self.OnFind, id=findId)
@@ -326,11 +327,13 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.OnNext, id=nextId)
         self.Bind(wx.EVT_MENU, self.OnPrev, id=prevId)
         self.Bind(wx.EVT_MENU, lambda evt: self.guiUtility.ShowPage('stats'), id=dispId)
+        self.Bind(wx.EVT_MENU, lambda evt: self.OpenInspectionTool(), id=wxId)
         self.Bind(wx.EVT_MENU, lambda evt: self.guiUtility.ShowPage('networkgraph'), id=anonId)
         self.Bind(wx.EVT_MENU, self.OnOpenDebugFrame, id=DISPERSY_DEBUG_FRAME_ID)
 
         accelerators = [(wx.ACCEL_CTRL, ord('f'), findId)]
         accelerators.append((wx.ACCEL_CTRL, ord('d'), dispId))
+        accelerators.append((wx.ACCEL_CTRL, ord('i'), wxId))
         accelerators.append((wx.ACCEL_CTRL, ord('n'), anonId))
         accelerators.append((wx.ACCEL_CTRL, wx.WXK_TAB, nextId))
         accelerators.append((wx.ACCEL_CTRL | wx.ACCEL_SHIFT, wx.WXK_TAB, prevId))
@@ -354,6 +357,10 @@ class MainFrame(wx.Frame):
 
         # If the user passed a torrentfile on the cmdline, load it.
         wx.CallAfter(post)
+
+    def OpenInspectionTool(self):
+        import wx.lib.inspection
+        wx.lib.inspection.InspectionTool().Show()
 
     def OnOpenDebugFrame(self, event=None):
         from Tribler.Main.vwxGUI.DispersyDebugFrame import DispersyDebugFrame
@@ -836,6 +843,10 @@ class MainFrame(wx.Frame):
                 print_exc()
 
         self._logger.info('GUI closing')
+        self.home.cancel_all_pending_tasks()
+        if self.utility.session.get_creditmining_enable():
+            self.creditminingpanel.cancel_all_pending_tasks()
+            self.creditminingpanel.sourcelist.cancel_all_pending_tasks()
         self.utility.abcquitting = True
         self.GUIupdate = False
 

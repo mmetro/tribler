@@ -6,17 +6,33 @@ import logging
 import os
 import socket
 from binascii import hexlify
+import time
 
+from twisted.internet import threads
+from twisted.internet.defer import inlineCallbacks
+from twisted.python.threadable import isInIOThread
+from Tribler.Core.DownloadConfig import DefaultDownloadStartupConfig, get_default_dest_dir
+
+from Tribler.Core.Utilities import torrent_utils
 from Tribler.Core import NoDispersyRLock
 from Tribler.Core.APIImplementation.LaunchManyCore import TriblerLaunchMany
 from Tribler.Core.CacheDB.Notifier import Notifier
 from Tribler.Core.CacheDB.sqlitecachedb import SQLiteCacheDB, DB_FILE_RELATIVE_PATH, DB_SCRIPT_RELATIVE_PATH
+from Tribler.Core.Config.tribler_config import TriblerConfig
+from Tribler.Core.Modules.restapi.rest_manager import RESTManager
 from Tribler.Core.SessionConfig import SessionConfigInterface, SessionStartupConfig
 from Tribler.Core.Upgrade.upgrade import TriblerUpgrader
-from Tribler.Core.exceptions import NotYetImplementedException, OperationNotEnabledByConfigurationException
+from Tribler.Core.Utilities.configparser import CallbackConfigParser
+from Tribler.Core.defaults import tribler_defaults
+from Tribler.Core.exceptions import NotYetImplementedException, OperationNotEnabledByConfigurationException, \
+    DuplicateTorrentFileError
 from Tribler.Core.simpledefs import (NTFY_CHANNELCAST, NTFY_DELETE, NTFY_INSERT, NTFY_METADATA, NTFY_MYPREFERENCES,
                                      NTFY_PEERS, NTFY_TORRENTS, NTFY_UPDATE, NTFY_VOTECAST, STATEDIR_DLPSTATE_DIR,
-                                     STATEDIR_METADATA_STORE_DIR, STATEDIR_PEERICON_DIR, STATEDIR_TORRENT_STORE_DIR)
+                                     STATEDIR_METADATA_STORE_DIR, STATEDIR_PEERICON_DIR, STATEDIR_TORRENT_STORE_DIR,
+                                     DLSTATUS_STOPPED, STATEDIR_GUICONFIG)
+from Tribler.Core.statistics import TriblerStatistics
+from Tribler.dispersy.util import blocking_call_on_reactor_thread
+
 
 GOTM2CRYPTO = False
 try:
@@ -101,7 +117,7 @@ class Session(SessionConfigInterface):
         # Reset the nickname to something not related to the host name, it was
         # really silly to have this default on the first place.
         # TODO: Maybe move this to the upgrader?
-        if socket.gethostname() in scfg.get_nickname():
+        if socket.gethostname().decode('utf-8', 'replace') in scfg.get_nickname():
             scfg.set_nickname("Tribler user")
 
         if GOTM2CRYPTO:
@@ -112,8 +128,7 @@ class Session(SessionConfigInterface):
             #
             pairfilename = scfg.get_permid_keypair_filename()
 
-            if os.access(pairfilename, os.F_OK):
-                # May throw exceptions
+            if os.path.exists(pairfilename):
                 self.keypair = permidmod.read_keypair(pairfilename)
             else:
                 self.keypair = permidmod.generate_keypair()
@@ -122,6 +137,18 @@ class Session(SessionConfigInterface):
                 pubfilename = os.path.join(scfg.get_state_dir(), 'ecpub.pem')
                 permidmod.save_keypair(self.keypair, pairfilename)
                 permidmod.save_pub_key(self.keypair, pubfilename)
+
+            multichain_pairfilename = scfg.get_multichain_permid_keypair_filename()
+
+            if os.path.exists(multichain_pairfilename):
+                self.multichain_keypair = permidmod.read_keypair_multichain(multichain_pairfilename)
+            else:
+                self.multichain_keypair = permidmod.generate_keypair_multichain()
+
+                # Save keypair
+                multichain_pubfilename = os.path.join(scfg.get_state_dir(), 'ecpub_multichain.pem')
+                permidmod.save_keypair_multichain(self.multichain_keypair, multichain_pairfilename)
+                permidmod.save_pub_key_multichain(self.multichain_keypair, multichain_pubfilename)
 
         if not scfg.get_megacache():
             scfg.set_torrent_checking(0)
@@ -135,7 +162,7 @@ class Session(SessionConfigInterface):
         self.get_listen_port()
         self.get_dispersy_port()
         self.get_mainline_dht_listen_port()
-        self.get_videoplayer_port()
+        self.get_videoserver_port()
 
         self.get_anon_listen_port()
         self.get_tunnel_community_socks5_listen_ports()
@@ -148,20 +175,32 @@ class Session(SessionConfigInterface):
         self.save_pstate_sessconfig()
 
         self.sqlite_db = None
+        self.dispersy_member = None
 
         self.autoload_discovery = autoload_discovery
 
+        self.tribler_config = TriblerConfig(self)
+        self.setup_tribler_gui_config()
+
+    @blocking_call_on_reactor_thread
     def prestart(self):
         """
         Pre-starts the session. We check the current version and upgrade if needed
 -        before we start everything else.
         """
+        assert isInIOThread()
         db_path = os.path.join(self.get_state_dir(), DB_FILE_RELATIVE_PATH)
         db_script_path = os.path.join(self.get_install_dir(), DB_SCRIPT_RELATIVE_PATH)
 
         self.sqlite_db = SQLiteCacheDB(db_path, db_script_path)
         self.sqlite_db.initialize()
         self.sqlite_db.initial_begin()
+
+        # Start the REST API before the upgrader since we want to send interesting upgrader events over the socket
+        if self.get_http_api_enabled():
+            self.lm.api_manager = RESTManager(self)
+            self.lm.api_manager.start()
+
         self.upgrader = TriblerUpgrader(self, self.sqlite_db)
         self.upgrader.run()
         return self.upgrader
@@ -190,18 +229,45 @@ class Session(SessionConfigInterface):
     #
     # Public methods
     #
-    def start_download_from_uri(self, uri):
+    def setup_tribler_gui_config(self):
+        """
+        Initialize the TriblerGUI configuration file.
+        """
+        configfilepath = os.path.join(self.get_state_dir(), STATEDIR_GUICONFIG)
+        gui_config = CallbackConfigParser()
+        DefaultDownloadStartupConfig.getInstance().set_dest_dir(get_default_dest_dir())
+
+        # Load the config file.
+        if os.path.exists(configfilepath):
+            gui_config.read_file(configfilepath, 'utf-8-sig')
+
+        if not gui_config.has_section('Tribler'):
+            gui_config.add_section('Tribler')
+            for k, v in tribler_defaults['Tribler'].iteritems():
+                gui_config.set('Tribler', k, v)
+
+        if not gui_config.has_section('downloadconfig'):
+            gui_config.add_section('downloadconfig')
+            for k, v in DefaultDownloadStartupConfig.getInstance().dlconfig._sections['downloadconfig'].iteritems():
+                gui_config.set('downloadconfig', k, v)
+
+        # Make sure we use the same ConfigParser instance for both Utility and DefaultDownloadStartupConfig.
+        DefaultDownloadStartupConfig.getInstance().dlconfig = gui_config
+
+        gui_config.write_file(configfilepath)
+
+    def start_download_from_uri(self, uri, dconfig=None):
         """
         Start a download from an argument. This argument can be of the following type:
         -http: Start a download from a torrent file at the given url.
         -magnet: Start a download from a torrent file by using a magnet link.
         -file: Start a download from a torrent file at given location.
-        :param argument: The argument that specifies the location of the torrent to be downloaded
-        :return: A LibtorrentDownloadImpl object that represents the new download. Can return none
-        if an error occurred during the start of the download.
+        :param uri: The argument that specifies the location of the torrent to be downloaded.
+        :param dconfig: An optional configuration for the download.
+        :return: A deferred that fires when a download has been added to the Tribler core.
         """
         if self.get_libtorrent():
-            return self.lm.ltmgr.start_download_from_uri(uri)
+            return self.lm.ltmgr.start_download_from_uri(uri, dconfig=dconfig)
         raise OperationNotEnabledByConfigurationException()
 
     def start_download_from_tdef(self, tdef, dcfg=None, initialdlstatus=None, hidden=False):
@@ -290,11 +356,12 @@ class Session(SessionConfigInterface):
         for download in downloadList:
             if download.get_def().get_infohash() == infohash:
                 self.remove_download(download, removecontent, removestate)
+                self.tribler_config.remove_download_state(infohash)
                 return
 
         self.lm.remove_id(infohash)
 
-    def set_download_states_callback(self, usercallback, getpeerlist=None):
+    def set_download_states_callback(self, usercallback, interval=1.0):
         """
         See Download.set_state_callback. Calls usercallback with a list of
         DownloadStates, one for each Download in the Session as first argument.
@@ -308,7 +375,7 @@ class Session(SessionConfigInterface):
 
         @param usercallback A function adhering to the above spec.
         """
-        self.lm.set_download_states_callback(usercallback, getpeerlist or [])
+        self.lm.set_download_states_callback(usercallback, interval)
 
     #
     # Config parameters that only exist at runtime
@@ -405,50 +472,84 @@ class Session(SessionConfigInterface):
         dbhandler.close()
 
     def get_statistics(self):
-        from Tribler.Core.statistics import TriblerStatistics
         return TriblerStatistics(self).dump_statistics()
+
+    def get_tribler_statistics(self):
+        """
+        Return a dictionary with general Tribler statistics.
+        """
+        return TriblerStatistics(self).get_tribler_statistics()
+
+    def get_dispersy_statistics(self):
+        """
+        Return a dictionary with general Dispersy statistics.
+        """
+        return TriblerStatistics(self).get_dispersy_statistics()
+
+    def get_community_statistics(self):
+        """
+        Return a dictionary with general communities statistics.
+        """
+        return TriblerStatistics(self).get_community_statistics()
 
     #
     # Persistence and shutdown
     #
-    def load_checkpoint(self, initialdlstatus=None, initialdlstatus_dict={}):
-        """ Restart Downloads from checkpoint, if any.
-
-        This method allows the API user to manage restoring downloads.
-        E.g. a video player that wants to start the torrent the user clicked
-        on first, and only then restart any sleeping torrents (e.g. seeding).
-        The optional initialdlstatus parameter can be set to DLSTATUS_STOPPED
-        to restore all the Downloads in DLSTATUS_STOPPED state.
-        The options initialdlstatus_dict parameter can be used to specify a
-        state overriding the initaldlstatus parameter per download id.
+    def load_checkpoint(self):
         """
-        self.lm.load_checkpoint(initialdlstatus, initialdlstatus_dict)
+        Restart Downloads from a saved checkpoint, if any. Note that we fetch information from the user download
+        choices since it might be that a user has stopped a download. In that case, the download should not be
+        resumed immediately when being loaded by libtorrent.
+        """
+        initialdlstatus_dict = {}
+        for infohash, state in self.tribler_config.get_download_states().iteritems():
+            if state == 'stop':
+                initialdlstatus_dict[infohash] = DLSTATUS_STOPPED
+
+        self.lm.load_checkpoint(initialdlstatus_dict=initialdlstatus_dict)
 
     def checkpoint(self):
         """ Saves the internal session state to the Session's state dir. """
         # Called by any thread
         self.checkpoint_shutdown(stop=False, checkpoint=True, gracetime=None, hacksessconfcheckpoint=False)
 
+    @blocking_call_on_reactor_thread
     def start(self):
         """ Create the LaunchManyCore instance and start it"""
 
         # Create engine with network thread
-        self.lm.register(self, self.sesslock, autoload_discovery=self.autoload_discovery)
+        startup_deferred = self.lm.register(self, self.sesslock)
+
+        if self.get_libtorrent():
+            self.load_checkpoint()
 
         self.sessconfig.set_callback(self.lm.sessconfig_changed_callback)
 
+        return startup_deferred
+
+    @blocking_call_on_reactor_thread
     def shutdown(self, checkpoint=True, gracetime=2.0, hacksessconfcheckpoint=True):
         """ Checkpoints the session and closes it, stopping the download engine.
         @param checkpoint Whether to checkpoint the Session state on shutdown.
         @param gracetime Time to allow for graceful shutdown + signoff (seconds).
         """
-        # Called by any thread
-        self.lm.early_shutdown()
-        self.checkpoint_shutdown(stop=True, checkpoint=checkpoint,
-                                 gracetime=gracetime, hacksessconfcheckpoint=hacksessconfcheckpoint)
+        # Has to be called from the reactor thread
+        assert isInIOThread()
 
-        self.sqlite_db.close()
-        self.sqlite_db = None
+        @inlineCallbacks
+        def on_early_shutdown_complete(_):
+            """
+            Callback that gets called when the early shutdown has been compelted.
+            Continues the shutdown procedure that is dependant on the early shutdown.
+            :param _: ignored parameter of the Deferred
+            """
+            yield self.checkpoint_shutdown(stop=True, checkpoint=checkpoint,
+                                 gracetime=gracetime, hacksessconfcheckpoint=hacksessconfcheckpoint)
+            if self.sqlite_db:
+                self.sqlite_db.close()
+            self.sqlite_db = None
+
+        return self.lm.early_shutdown().addCallback(on_early_shutdown_complete)
 
     def has_shutdown(self):
         """ Whether the Session has completely shutdown, i.e., its internal
@@ -554,7 +655,7 @@ class Session(SessionConfigInterface):
             # Checkpoint all Downloads and stop NetworkThread
             if stop:
                 self._logger.debug("Session: checkpoint_shutdown")
-            self.lm.checkpoint(stop=stop, checkpoint=checkpoint, gracetime=gracetime)
+            return self.lm.checkpoint(stop=stop, checkpoint=checkpoint, gracetime=gracetime)
 
     def save_pstate_sessconfig(self):
         """ Save the runtime SessionConfig to disk """
@@ -601,6 +702,16 @@ class Session(SessionConfigInterface):
             raise OperationNotEnabledByConfigurationException("torrent_store is not enabled")
         self.lm.torrent_store.put(hexlify(infohash), data)
 
+    def delete_collected_torrent(self, infohash):
+        """
+        Deletes the given torrent from the torrent_store database.
+        :param infohash: The given infohash binary.
+        """
+        if not self.get_torrent_store():
+            raise OperationNotEnabledByConfigurationException("torrent_store is not enabled")
+
+        del self.lm.torrent_store[hexlify(infohash)]
+
     def search_remote_torrents(self, keywords):
         """
         Searches for remote torrents through SearchCommunity with the given keywords.
@@ -620,23 +731,66 @@ class Session(SessionConfigInterface):
             raise OperationNotEnabledByConfigurationException("channel_search is not enabled")
         self.lm.search_manager.search_for_channels(keywords)
 
-    def create_channel(self, name, description, mode=u'open'):
+    def create_torrent_file(self, file_path_list, params={}):
+        """
+        :param file_path_list: files to add in torrent file
+        :param params: optional parameters for torrent file
+        :return: Deferred
+        """
+        return threads.deferToThread(torrent_utils.create_torrent_file, file_path_list, params)
+
+    def create_channel(self, name, description, mode=u'closed'):
         """
         Creates a new Channel.
         :param name: Name of the Channel.
         :param description: Description of the Channel.
         :param mode: Mode of the Channel ('open', 'semi-open', or 'closed').
+        :return: Channel ID
+        :raises DuplicateChannelNameError if name already exists
         """
-        if not self.get_enable_channel_search():
-            raise OperationNotEnabledByConfigurationException("channel_search is not enabled")
-        self.lm.channel_manager.create_channel(name, description, mode)
+        return self.lm.channel_manager.create_channel(name, description, mode)
+
+    def add_torrent_def_to_channel(self, channel_id, torrent_def, extra_info={}, forward=True):
+        """
+        Adds a TorrentDef to a Channel.
+        :param channel_id: Id of the Channel to add the Torrent to.
+        :param torrent_def: Definition of the Torrent to add.
+        :param extra_info: Description of the Torrent to add.
+        :param forward: When True the messages are forwarded (as defined by their message
+         destination policy) to other nodes in the community. This parameter should (almost always)
+         be True, its inclusion is mostly to allow certain debugging scenarios.
+        """
+        # Make sure that this new torrent_def is also in collected torrents
+        self.lm.rtorrent_handler.save_torrent(torrent_def)
+
+        channelcast_db = self.open_dbhandler(NTFY_CHANNELCAST)
+        if channelcast_db.hasTorrent(channel_id, torrent_def.infohash):
+            raise DuplicateTorrentFileError()
+
+        dispersy_cid = str(channelcast_db.getDispersyCIDFromChannelId(channel_id))
+        community = self.get_dispersy_instance().get_community(dispersy_cid)
+
+        community._disp_create_torrent(
+            torrent_def.infohash,
+            long(time.time()),
+            torrent_def.get_name_as_unicode(),
+            tuple(torrent_def.get_files_as_unicode_with_length()),
+            torrent_def.get_trackers_as_single_tuple(),
+            forward=forward)
+
+        if 'description' in extra_info:
+            desc = extra_info['description'].strip()
+            if desc != '':
+                data = channelcast_db.getTorrentFromChannelId(channel_id, torrent_def.infohash, ['ChannelTorrents.id'])
+                community.modifyTorrent(data, {'description': desc}, forward=forward)
 
     def check_torrent_health(self, infohash):
         """
         Checks the given torrent's health on its trackers.
         :param infohash: The given torrent infohash.
         """
-        self.lm.torrent_checker.add_gui_request(infohash)
+        if self.lm.torrent_checker:
+            self.lm.torrent_checker.add_gui_request(infohash)
 
     def set_max_upload_speed(self, rate):
         """

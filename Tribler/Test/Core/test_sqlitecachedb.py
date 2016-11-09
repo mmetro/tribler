@@ -1,9 +1,11 @@
 import os
+import sys
+import shutil
 
 from apsw import SQLError, CantOpenError
-
-import shutil
+from unittest import skipIf
 from nose.tools import raises
+from twisted.internet.defer import inlineCallbacks
 
 from Tribler.Test.Core.base_test import TriblerCoreTest
 from Tribler.Core.CacheDB.sqlitecachedb import SQLiteCacheDB, DB_SCRIPT_NAME, CorruptedDatabaseError
@@ -15,8 +17,10 @@ class TestSqliteCacheDB(TriblerCoreTest):
     FILE_DIR = os.path.abspath(os.path.dirname(os.path.realpath(__file__)))
     SQLITE_SCRIPTS_DIR = os.path.abspath(os.path.join(FILE_DIR, u"data/sqlite_scripts/"))
 
+    @blocking_call_on_reactor_thread
+    @inlineCallbacks
     def setUp(self):
-        super(TestSqliteCacheDB, self).setUp()
+        yield super(TestSqliteCacheDB, self).setUp()
 
         db_path = u":memory:"
 
@@ -94,6 +98,7 @@ class TestSqliteCacheDB(TriblerCoreTest):
         sqlite_test_2.initial_begin()
 
     @blocking_call_on_reactor_thread
+    @skipIf(sys.platform == "win32", "chmod does not work on Windows")
     @raises(IOError)
     def test_no_permission_on_script(self):
         db_path = os.path.join(self.session_base_dir, "test_db.db")
@@ -118,6 +123,7 @@ class TestSqliteCacheDB(TriblerCoreTest):
         sqlite_test_2.clean_db(vacuum=True, exiting=True)
 
     @blocking_call_on_reactor_thread
+    @skipIf(sys.platform == "win32", "chmod does not work on Windows")
     @raises(CantOpenError)
     def test_open_db_connection_no_permission(self):
         os.chmod(os.path.join(self.session_base_dir), 0)
@@ -190,3 +196,29 @@ class TestSqliteCacheDB(TriblerCoreTest):
         self.sqlite_test.update('person', "lastname == '4'", firstname=654, lastname=44)
         one = self.sqlite_test.fetchone("select firstname from person where lastname == 44")
         self.assertEqual(one, 654)
+
+    @blocking_call_on_reactor_thread
+    def test_delete_single_element(self):
+        """
+        This test tests whether deleting using a single element as value works.
+        """
+        self.test_insert()
+        self.sqlite_test.insert('person', lastname='x', firstname='z')
+        one = self.sqlite_test.fetchone(u"SELECT * FROM person")
+        self.assertEqual(one, ('a', 'b'))
+        self.sqlite_test.delete("person", lastname="a")
+        one = self.sqlite_test.fetchone(u"SELECT * FROM person")
+        self.assertEqual(one, ('x', 'z'))
+
+    @blocking_call_on_reactor_thread
+    def test_delete_tuple(self):
+        """
+        This test tests whether deleting using a tuple as value works.
+        """
+        self.test_insert()
+        self.sqlite_test.insert('person', lastname='x', firstname='z')
+        one = self.sqlite_test.fetchone(u"SELECT * FROM person")
+        self.assertEqual(one, ('a', 'b'))
+        self.sqlite_test.delete("person", lastname=("LIKE", "a"))
+        one = self.sqlite_test.fetchone(u"SELECT * FROM person")
+        self.assertEqual(one, ('x', 'z'))

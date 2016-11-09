@@ -26,7 +26,7 @@ class TestSessionConfig(TriblerCoreTest):
         sci.set_state_dir(self.session_base_dir)
         self.assertEqual(sci.get_state_dir(), self.session_base_dir)
 
-        self.assertIsInstance(sci.get_install_dir(), str)
+        self.assertIsInstance(sci.get_install_dir(), (unicode, str))
         self.assertIsInstance(sci.get_permid_keypair_filename(), str)
 
         sci.set_listen_port(1337)
@@ -36,6 +36,9 @@ class TestSessionConfig(TriblerCoreTest):
         self.assertIsInstance(sci.get_tunnel_community_socks5_listen_ports(), list)
         self.assertFalse(sci.get_tunnel_community_exitnode_enabled())
         self.assertFalse(sci.get_barter_community_enabled())
+
+        sci.set_tunnel_community_enabled(False)
+        self.assertFalse(sci.get_tunnel_community_enabled())
 
         sci.set_megacache(False)
         self.assertFalse(sci.get_megacache())
@@ -105,14 +108,14 @@ class TestSessionConfig(TriblerCoreTest):
         self.assertIsInstance(sci.get_dispersy_port(), int)
         self.assertEqual(sci.sessconfig.get('dispersy', 'dispersy_port'), 1337)
 
-        sci.set_videoplayer(False)
-        self.assertFalse(sci.get_videoplayer())
+        sci.set_videoserver_enabled(False)
+        self.assertFalse(sci.get_videoserver_enabled())
 
         sci.set_videoplayer_path(self.session_base_dir)
         self.assertEqual(sci.get_videoplayer_path(), self.session_base_dir)
 
-        sci.set_videoplayer_port(1337)
-        self.assertIsInstance(sci.get_videoplayer_port(), int)
+        sci.set_videoserver_port(1337)
+        self.assertIsInstance(sci.get_videoserver_port(), int)
         self.assertEqual(sci.sessconfig.get('video', 'port'), 1337)
 
         sci.set_preferred_playback_mode(5)
@@ -130,8 +133,20 @@ class TestSessionConfig(TriblerCoreTest):
         sci.set_metadata_store_dir(self.session_base_dir)
         self.assertEqual(sci.get_metadata_store_dir(), self.session_base_dir)
 
+        sci.set_channel_community_enabled(False)
+        self.assertFalse(sci.get_channel_community_enabled())
+
+        sci.set_preview_channel_community_enabled(False)
+        self.assertFalse(sci.get_preview_channel_community_enabled())
+
         sci.set_upgrader_enabled(False)
         self.assertFalse(sci.get_upgrader_enabled())
+
+        sci.set_http_api_enabled(True)
+        self.assertTrue(sci.get_http_api_enabled())
+
+        sci.set_http_api_port(1337)
+        self.assertEqual(sci.sessconfig.get('http_api', 'port'), 1337)
 
         self.assertIsInstance(sci.get_default_config_filename(self.session_base_dir), str)
 

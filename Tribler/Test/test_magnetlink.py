@@ -5,11 +5,16 @@ from binascii import hexlify
 import socket
 import os
 import threading
+from twisted.internet import reactor
+
+from twisted.internet.defer import inlineCallbacks
+
 import libtorrent as lt
+from Tribler.dispersy.util import blocking_call_on_reactor_thread
 from libtorrent import bencode, bdecode
 
 from Tribler.Test.common import UBUNTU_1504_INFOHASH
-from Tribler.Test.test_as_server import TestAsServer, TESTS_API_DIR
+from Tribler.Test.test_as_server import TestAsServer, TESTS_API_DIR, TESTS_DATA_DIR
 
 from btconn import BTConnection
 from Tribler.Core.TorrentDef import TorrentDef
@@ -174,7 +179,7 @@ class TestMagnetFakePeer(TestAsServer, MagnetHelpers):
 
         # the metadata that we want to transfer
         self.tdef = TorrentDef()
-        self.tdef.add_content(os.path.join(TESTS_API_DIR, "video.avi"))
+        self.tdef.add_content(os.path.join(TESTS_DATA_DIR, "video.avi"))
         self.tdef.set_tracker("http://localhost/announce")
         # we use a small piece length to obtain multiple pieces
         self.tdef.set_piece_length(1)
@@ -217,7 +222,7 @@ class TestMagnetFakePeer(TestAsServer, MagnetHelpers):
             for infohash in ltmgr.metainfo_requests:
                 handle = ltmgr.ltsession.find_torrent(lt.big_number(infohash.decode('hex')))
                 handle.connect_peer(("127.0.0.1", self.session.get_listen_port()), 0)
-        self.session.lm.threadpool.add_task(do_supply, delay=5.0)
+        reactor.callFromThread(reactor.callLater(5, do_supply))
 
         # accept incoming connection
         # self.server.settimeout(10.0)
@@ -257,7 +262,7 @@ class TestMetadataFakePeer(TestAsServer, MagnetHelpers):
 
         # the metadata that we want to transfer
         self.tdef = TorrentDef()
-        self.tdef.add_content(os.path.join(TESTS_API_DIR, "file.wmv"))
+        self.tdef.add_content(os.path.join(TESTS_DATA_DIR, "file.wmv"))
         self.tdef.set_tracker("http://localhost/announce")
         # we use a small piece length to obtain multiple pieces
         self.tdef.set_piece_length(1)
@@ -273,22 +278,21 @@ class TestMetadataFakePeer(TestAsServer, MagnetHelpers):
         self.config2 = self.config.copy()
         self.config2.set_state_dir(self.getStateDir(2))
 
-    def tearDown(self):
-        self.teardown_seeder()
-        TestAsServer.tearDown(self)
+    @blocking_call_on_reactor_thread
+    @inlineCallbacks
+    def tearDown(self, annotate=True):
+        self.session.remove_download(self.download)
+        yield super(TestMetadataFakePeer, self).tearDown(annotate=annotate)
 
     def setup_seeder(self):
         self.seeder_setup_complete = threading.Event()
 
         self.dscfg = DownloadStartupConfig()
-        self.dscfg.set_dest_dir(TESTS_API_DIR)
+        self.dscfg.set_dest_dir(TESTS_DATA_DIR)
         self.download = self.session.start_download_from_tdef(self.tdef, self.dscfg)
         self.download.set_state_callback(self.seeder_state_callback)
 
         assert self.seeder_setup_complete.wait(30)
-
-    def teardown_seeder(self):
-        self.session.remove_download(self.download)
 
     def seeder_state_callback(self, ds):
         if ds.get_status() == DLSTATUS_SEEDING:

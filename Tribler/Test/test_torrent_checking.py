@@ -1,15 +1,20 @@
 from time import sleep
 
+from twisted.internet.defer import inlineCallbacks
+
 from Tribler.Core.TorrentDef import TorrentDef
 from Tribler.Core.simpledefs import NTFY_MYPREFERENCES, NTFY_TORRENTS
+from Tribler.Test.common import TORRENT_FILE
 from Tribler.Test.test_as_server import TestAsServer
-from Tribler.Test.test_libtorrent_download import TORRENT_FILE
+from Tribler.dispersy.util import blocking_call_on_reactor_thread
 
 
 class TestTorrentChecking(TestAsServer):
 
+    @blocking_call_on_reactor_thread
+    @inlineCallbacks
     def setUp(self):
-        super(TestTorrentChecking, self).setUp()
+        yield super(TestTorrentChecking, self).setUp()
 
         self.tdb = self.session.open_dbhandler(NTFY_TORRENTS)
         self.tdb.mypref_db = self.session.open_dbhandler(NTFY_MYPREFERENCES)
@@ -36,4 +41,22 @@ class TestTorrentChecking(TestAsServer):
 
         num_seeders = torrent['num_seeders']
         num_leechers = torrent['num_leechers']
-        assert num_leechers >= 0 or num_seeders >= 0, "No peers found: leechers: %d seeders: %d" % (num_leechers, num_seeders)
+        assert num_leechers >= 0 or num_seeders >= 0, "No peers found: leechers: %d seeders: %d" % (
+        num_leechers, num_seeders)
+
+    def test_udp_torrent_checking(self):
+        tdef = TorrentDef.load(TORRENT_FILE)
+        tdef.set_tracker("udp://localhost")
+        tdef.metainfo_valid = True
+
+        self.tdb.addExternalTorrent(tdef)
+        self.session.check_torrent_health(tdef.get_infohash())
+        sleep(31)
+
+        torrent = self.tdb.getTorrent(tdef.get_infohash())
+        self._logger.debug('got torrent %s', torrent)
+
+        num_seeders = torrent['num_seeders']
+        num_leechers = torrent['num_leechers']
+        assert num_leechers >= 0 or num_seeders >= 0, \
+            "No peers found: leechers: %d seeders: %d" % (num_leechers, num_seeders)

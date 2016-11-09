@@ -9,7 +9,7 @@ import sys
 
 import wx
 
-from Tribler.Category.Category import Category
+from Tribler.Core.Category.Category import Category
 from Tribler.Core.CacheDB.sqlitecachedb import bin2str, str2bin, forceAndReturnDBThread
 from Tribler.Core.TorrentDef import TorrentDef, TorrentDefNoMetainfo
 from Tribler.Core.Video.utils import videoextdefaults
@@ -21,14 +21,12 @@ from Tribler.Main.Utility.GuiDBHandler import startWorker, GUI_PRI_DISPERSY
 from Tribler.Main.Utility.GuiDBTuples import (Torrent, ChannelTorrent, CollectedTorrent, RemoteTorrent,
                                               NotCollectedTorrent, LibraryTorrent, Comment, Modification, Channel,
                                               RemoteChannel, Playlist, Moderation, RemoteChannelTorrent, Marking)
-from Tribler.Main.globals import DefaultDownloadStartupConfig
+from Tribler.Core.DownloadConfig import DefaultDownloadStartupConfig
 from Tribler.Main.vwxGUI import (warnWxThread, forceWxThread, TORRENT_REQ_COLUMNS,
                                  CHANNEL_REQ_COLUMNS, PLAYLIST_REQ_COLUMNS, MODIFICATION_REQ_COLUMNS,
                                  MODERATION_REQ_COLUMNS, MARKING_REQ_COLUMNS, COMMENT_REQ_COLUMNS)
-from Tribler.Main.vwxGUI.UserDownloadChoice import UserDownloadChoice
-
 from Tribler.community.allchannel.community import AllChannelCommunity
-from Tribler.community.channel.community import (ChannelCommunity, warnIfNotDispersyThread)
+from Tribler.community.channel.community import (warnIfNotDispersyThread)
 from Tribler.dispersy.exception import CommunityNotFoundException
 from Tribler.dispersy.util import call_on_reactor_thread
 
@@ -58,7 +56,7 @@ class TorrentManager(object):
 
         self.filteredResults = 0
 
-        self.category = Category.getInstance()
+        self.category = self.guiUtility.utility.session.lm.category
 
     def downloadTorrentfileFromPeers(self, torrent, callback, duplicate=True, prio=0):
         """
@@ -557,7 +555,6 @@ class LibraryManager(object):
 
         # Gui callbacks
         self.gui_callback = []
-        self.user_download_choice = UserDownloadChoice.get_singleton()
         self.wantpeers = []
 
         self.last_vod_torrent = None
@@ -579,6 +576,7 @@ class LibraryManager(object):
         return self.wantpeers
 
     def magnet_started(self, infohash):
+        # [time, amount of peers, ????]
         self.magnetlist[infohash] = [long(time()), 0, 0]
 
     def magnet_got_peers(self, infohash, total_peers):
@@ -612,6 +610,12 @@ class LibraryManager(object):
             self.gui_callback.remove(callback)
 
     def set_want_peers(self, hashes, enable=True):
+        """
+        Sets whether or now we want hashes, appending or removing them
+        from the wantpeers list.
+        :param hashes: A list of hashes we want to add or remove from the wantpeers list
+        :param enable: A boolean indicating if they should be removed or added
+        """
         if not enable:
             for h in hashes:
                 if h in self.wantpeers:
@@ -631,10 +635,7 @@ class LibraryManager(object):
 
     def addDownloadStates(self, torrentlist):
         for torrent in torrentlist:
-            for ds in self.dslist:
-                torrent.addDs(ds)
-            if torrent.infohash in self.magnetlist:
-                torrent.magnetstatus = self.magnetlist[torrent.infohash]
+            self.addDownloadState(torrent)
         return torrentlist
 
     def startLastVODTorrent(self):
@@ -747,10 +748,8 @@ class LibraryManager(object):
             resumed = True
 
             infohash = download.get_def().get_infohash()
-            self.user_download_choice.set_download_state(
-                infohash,
-                "restartseed" if force_seed and download.get_progress(
-                ) == 1.0 else "restart")
+            value = "restartseed" if force_seed and download.get_progress() == 1.0 else "restart"
+            self.session.tribler_config.set_download_state(infohash, value)
 
         if not resumed:
             torrent_data = self.guiUtility.utility.session.get_collected_torrent(torrent.infohash)
@@ -774,7 +773,7 @@ class LibraryManager(object):
             download.stop()
 
             infohash = download.get_def().get_infohash()
-            self.user_download_choice.set_download_state(infohash, "stop")
+            self.session.tribler_config.set_download_state(infohash, "stop")
 
     def deleteTorrent(self, torrent, removecontent=False):
         ds = torrent.download_state
@@ -784,7 +783,6 @@ class LibraryManager(object):
             self.stopVideoIfEqual(ds.download, reset_playlist=True)
 
         self.session.remove_download_by_id(infohash, removecontent, removestate=True)
-        self.user_download_choice.remove_download_state(infohash)
 
     def stopVideoIfEqual(self, download, reset_playlist=False):
         videoplayer = self._get_videoplayer()
@@ -913,14 +911,13 @@ class ChannelManager(object):
         self.channelcast_db = None
         self.votecastdb = None
         self.dispersy = None
+        self.category = None
 
         # For asking for a refresh when remote results came in
         self.gridmgr = None
 
         self.searchkeywords = []
         self.oldsearchkeywords = []
-
-        self.category = Category.getInstance()
 
     def getInstance(*args, **kw):
         if ChannelManager.__single is None:
@@ -936,6 +933,7 @@ class ChannelManager(object):
         if not self.connected:
             self.connected = True
             self.session = session
+            self.category = self.session.lm.category
             self.torrent_db = self.session.open_dbhandler(NTFY_TORRENTS)
             self.channelcast_db = self.session.open_dbhandler(NTFY_CHANNELCAST)
             self.votecastdb = self.session.open_dbhandler(NTFY_VOTECAST)
@@ -1001,11 +999,11 @@ class ChannelManager(object):
         return self._createChannels(allchannels)
 
     def getMySubscriptions(self):
-        subscriptions = self.channelcast_db.getMySubscribedChannels(includeDispsersy=True)
+        subscriptions = self.channelcast_db.getMySubscribedChannels(include_dispersy=True)
         return self._createChannels(subscriptions)
 
-    def getPopularChannels(self):
-        pchannels = self.channelcast_db.getMostPopularChannels()
+    def getPopularChannels(self, nr_top_popular=20):
+        pchannels = self.channelcast_db.getMostPopularChannels(nr_top_popular)
         return self._createChannels(pchannels)
 
     def getUpdatedChannels(self):

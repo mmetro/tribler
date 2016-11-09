@@ -2,44 +2,39 @@
 # Improved and Modified by Niels Zeilemaker
 # see LICENSE.txt for license information
 
-# Initialize x11 threads before doing anything X11 related.
-from twisted.internet.base import BasePort
-from Tribler.Main.Utility.utility import initialize_x11_threads
-initialize_x11_threads()
-
-# set wxpython version before importing wx or anything from Tribler
-import wxversion
-if wxversion.checkInstalled("3.0-unicode"):
-    wxversion.select("3.0-unicode")
-else:
-    wxversion.select("2.8-unicode")
-
 # Make sure the in thread reactor is installed.
-from Tribler.Core.Utilities.twisted_thread import reactor
-
+from Tribler.Core.Utilities.network_utils import get_random_port
+from Tribler.Core.Utilities.twisted_thread import reactor, deferred
 
 # importmagic: manage
+import threading
 import functools
-import gc
 import inspect
 import logging
 import os
 import re
 import shutil
-import sys
 import time
 import unittest
 from tempfile import mkdtemp
-from threading import Event, enumerate as enumerate_threads
+from threading import enumerate as enumerate_threads
 from traceback import print_exc
 
-import wx
-from .util import process_unhandled_exceptions
+from twisted.internet import interfaces
+from twisted.internet.base import BasePort
+from twisted.internet.defer import maybeDeferred, inlineCallbacks, Deferred, succeed
+from twisted.python.threadable import isInIOThread
+from twisted.web.server import Site
+from twisted.web.static import File
 
+from Tribler.Core.DownloadConfig import DownloadStartupConfig
+from Tribler.Core.TorrentDef import TorrentDef
+from Tribler.Core.simpledefs import dlstatus_strings, DLSTATUS_SEEDING, UPLOAD
 from Tribler.Core import defaults
 from Tribler.Core.Session import Session
 from Tribler.Core.SessionConfig import SessionStartupConfig
 from Tribler.Core.Utilities.instrumentation import WatchDog
+from Tribler.Test.util import process_unhandled_exceptions, process_unhandled_twisted_exceptions
 from Tribler.dispersy.util import blocking_call_on_reactor_thread
 
 
@@ -51,10 +46,10 @@ defaults.sessdefaults['general']['minport'] = -1
 defaults.sessdefaults['general']['maxport'] = -1
 defaults.sessdefaults['dispersy']['dispersy_port'] = -1
 
-DEBUG = False
+# We disable safe seeding by default
+defaults.dldefaults['downloadconfig']['safe_seeding'] = False
 
 OUTPUT_DIR = os.path.abspath(os.environ.get('OUTPUT_DIR', 'output'))
-
 
 
 class BaseTestCase(unittest.TestCase):
@@ -87,6 +82,11 @@ class AbstractServer(BaseTestCase):
         super(AbstractServer, self).__init__(*args, **kwargs)
 
         self.watchdog = WatchDog()
+        self.selected_socks5_ports = set()
+
+        # Enable Deferred debugging
+        from twisted.internet.defer import setDebugging
+        setDebugging(True)
 
     def setUp(self, annotate=True):
         self._logger = logging.getLogger(self.__class__.__name__)
@@ -98,44 +98,87 @@ class AbstractServer(BaseTestCase):
         defaults.sessdefaults['general']['state_dir'] = self.state_dir
         defaults.dldefaults["downloadconfig"]["saveas"] = self.dest_dir
 
+        self.checkReactor(phase="setUp")
+
         self.setUpCleanup()
         os.makedirs(self.session_base_dir)
         self.annotate_dict = {}
 
+        self.file_server = None
+        self.dscfg_seed = None
+
         if annotate:
             self.annotate(self._testMethodName, start=True)
         self.watchdog.start()
-
 
     def setUpCleanup(self):
         # Change to an existing dir before cleaning up.
         os.chdir(TESTS_DIR)
         shutil.rmtree(unicode(self.session_base_dir), ignore_errors=True)
 
+    def setUpFileServer(self, port, path):
+        # Create a local file server, can be used to serve local files. This is preferred over an external network
+        # request in order to get files.
+        resource = File(path)
+        factory = Site(resource)
+        self.file_server = reactor.listenTCP(port, factory)
+
+    @blocking_call_on_reactor_thread
+    @inlineCallbacks
+    def checkReactor(self, phase, *_):
+        delayed_calls = reactor.getDelayedCalls()
+        if delayed_calls:
+            self._logger.error("The reactor was dirty during %s:", phase)
+            for dc in delayed_calls:
+                self._logger.error(">     %s" % dc)
+                dc.cancel()
+
+        # This is the same check as in the _cleanReactor method of Twisted's Trial
+        selectable_strings = []
+        for sel in reactor.removeAll():
+            if interfaces.IProcessTransport.providedBy(sel):
+                self._logger.error("Sending kill signal to %s", repr(sel))
+                sel.signalProcess('KILL')
+            selectable_strings.append(repr(sel))
+
+        self.assertFalse(delayed_calls, "The reactor was dirty during %s" % phase)
+        if Session.has_instance():
+            try:
+                yield Session.get_instance().shutdown()
+            except:
+                pass
+            Session.del_instance()
+
+            raise RuntimeError("Found a leftover session instance during %s" % phase)
+
+        self.assertFalse(selectable_strings,
+                         "The reactor has leftover readers/writers during %s: %r" % (phase, selectable_strings))
+
+        # Check whether we have closed all the sockets
+        open_readers = reactor.getReaders()
+        for reader in open_readers:
+            self.assertNotIsInstance(reader, BasePort,
+                                     "Listening ports left on the reactor during %s: %s" % (phase, reader))
+
+    @blocking_call_on_reactor_thread
     def tearDown(self, annotate=True):
         self.tearDownCleanup()
         if annotate:
             self.annotate(self._testMethodName, start=False)
 
-        delayed_calls = reactor.getDelayedCalls()
-        if delayed_calls:
-            self._logger.error("The reactor was dirty:")
-            for dc in delayed_calls:
-                self._logger.error(">     %s" % dc)
-        self.assertFalse(delayed_calls, "The reactor was dirty when tearing down the test")
-        self.assertFalse(Session.has_instance(), 'A session instance is still present when tearing down the test')
-
-        # Check whether we have closed all the sockets
-        open_readers = reactor.getReaders()
-        for reader in open_readers:
-            self.assertNotIsInstance(reader, BasePort, "The test left a listening port behind: %s" % reader)
-
         process_unhandled_exceptions()
+        process_unhandled_twisted_exceptions()
+
         self.watchdog.join(2)
         if self.watchdog.is_alive():
             self._logger.critical("The WatchDog didn't stop!")
             self.watchdog.print_all_stacks()
             raise RuntimeError("Couldn't stop the WatchDog")
+
+        if self.file_server:
+            return maybeDeferred(self.file_server.stopListening).addCallback(self.checkReactor)
+        else:
+            return self.checkReactor("tearDown")
 
     def tearDownCleanup(self):
         self.setUpCleanup()
@@ -173,6 +216,31 @@ class AbstractServer(BaseTestCase):
             print >> f, _annotation, self.annotate_dict[annotation], time.time()
             f.close()
 
+    def get_bucket_range_port(self):
+        """
+        Return the port range of the test bucket assigned.
+        """
+        min_base_port = 1000 if not os.environ.get("TEST_BUCKET", None) \
+            else int(os.environ['TEST_BUCKET']) * 2000 + 2000
+        return min_base_port, min_base_port + 2000
+
+    def get_socks5_ports(self):
+        """
+        Return five random, free socks5 ports.
+        This is here to make sure that tests in different buckets get assigned different SOCKS5 listen ports.
+        Also, make sure that we have no duplicates in selected socks5 ports.
+        """
+        socks5_ports = []
+        for _ in xrange(0, 5):
+            min_base_port, max_base_port = self.get_bucket_range_port()
+            selected_port = get_random_port(min_port=min_base_port, max_port=max_base_port)
+            while selected_port in self.selected_socks5_ports:
+                selected_port = get_random_port(min_port=min_base_port, max_port=max_base_port)
+            self.selected_socks5_ports.add(selected_port)
+            socks5_ports.append(selected_port)
+
+        return socks5_ports
+
 
 class TestAsServer(AbstractServer):
 
@@ -180,23 +248,28 @@ class TestAsServer(AbstractServer):
     Parent class for testing the server-side of Tribler
     """
 
-    def setUp(self):
-        super(TestAsServer, self).setUp(annotate=False)
+    @blocking_call_on_reactor_thread
+    @inlineCallbacks
+    def setUp(self, autoload_discovery=True):
+        yield super(TestAsServer, self).setUp(annotate=False)
         self.setUpPreSession()
 
         self.quitting = False
+        self.seeding_deferred = Deferred()
+        self.seeder_session = None
 
         self.session = Session(self.config)
         upgrader = self.session.prestart()
-        while not upgrader.is_done:
-            time.sleep(0.1)
+        assert upgrader.is_done
+
         assert not upgrader.failed, upgrader.current_status
-        self.session.start()
+        self.tribler_started_deferred = self.session.start()
+
+        yield self.tribler_started_deferred
 
         self.hisport = self.session.get_listen_port()
 
-        while not self.session.lm.initComplete:
-            time.sleep(1)
+        assert self.session.lm.initComplete
 
         self.annotate(self._testMethodName, start=True)
 
@@ -215,50 +288,108 @@ class TestAsServer(AbstractServer):
         self.config.set_torrent_collecting(False)
         self.config.set_libtorrent(False)
         self.config.set_dht_torrent_collecting(False)
-        self.config.set_videoplayer(False)
+        self.config.set_videoserver_enabled(False)
         self.config.set_enable_metadata(False)
         self.config.set_upgrader_enabled(False)
+        self.config.set_http_api_enabled(False)
+        self.config.set_tunnel_community_enabled(False)
+        self.config.set_creditmining_enable(False)
+        self.config.set_enable_multichain(False)
 
-    def tearDown(self):
+    @blocking_call_on_reactor_thread
+    @inlineCallbacks
+    def tearDown(self, annotate=True):
         self.annotate(self._testMethodName, start=False)
 
         """ unittest test tear down code """
         if self.session is not None:
-            self._shutdown_session(self.session)
+            assert self.session is Session.get_instance()
+            yield self.session.shutdown()
+            assert self.session.has_shutdown()
             Session.del_instance()
 
-        time.sleep(10)
-        gc.collect()
+        yield self.stop_seeder()
 
         ts = enumerate_threads()
         self._logger.debug("test_as_server: Number of threads still running %d", len(ts))
         for t in ts:
             self._logger.debug("Thread still running %s, daemon: %s, instance: %s", t.getName(), t.isDaemon(), t)
 
-        super(TestAsServer, self).tearDown(annotate=False)
+        yield super(TestAsServer, self).tearDown(annotate=False)
 
-    def _shutdown_session(self, session):
-        session_shutdown_start = time.time()
-        waittime = 60
+    def create_local_torrent(self, source_file):
+        '''
+        This method creates a torrent from a local file and saves the torrent in the session state dir.
+        Note that the source file needs to exist.
+        '''
+        self.assertTrue(os.path.exists(source_file))
 
-        session.shutdown()
-        while not session.has_shutdown():
-            diff = time.time() - session_shutdown_start
-            assert diff < waittime, "test_as_server: took too long for Session to shutdown"
+        tdef = TorrentDef()
+        tdef.add_content(source_file)
+        tdef.set_tracker("http://localhost/announce")
+        tdef.finalize()
 
-            self._logger.debug(
-                "Waiting for Session to shutdown, will wait for an additional %d seconds", (waittime - diff))
+        torrent_path = os.path.join(self.session.get_state_dir(), "seed.torrent")
+        tdef.save(torrent_path)
 
-            wx.SafeYield()
-            time.sleep(1)
+        return tdef, torrent_path
 
-        self._logger.debug("Session has shut down")
+    def setup_seeder(self, tdef, seed_dir):
+        self.seed_config = SessionStartupConfig()
+        self.seed_config.set_torrent_checking(False)
+        self.seed_config.set_multicast_local_peer_discovery(False)
+        self.seed_config.set_megacache(False)
+        self.seed_config.set_dispersy(False)
+        self.seed_config.set_mainline_dht(False)
+        self.seed_config.set_torrent_store(False)
+        self.seed_config.set_enable_torrent_search(False)
+        self.seed_config.set_enable_channel_search(False)
+        self.seed_config.set_torrent_collecting(False)
+        self.seed_config.set_libtorrent(True)
+        self.seed_config.set_dht_torrent_collecting(False)
+        self.seed_config.set_videoserver_enabled(False)
+        self.seed_config.set_enable_metadata(False)
+        self.seed_config.set_upgrader_enabled(False)
+        self.seed_config.set_tunnel_community_enabled(False)
+        self.seed_config.set_state_dir(self.getStateDir(2))
+
+        def start_seed_download(_):
+            self.dscfg_seed = DownloadStartupConfig()
+            self.dscfg_seed.set_dest_dir(seed_dir)
+            d = self.seeder_session.start_download_from_tdef(tdef, self.dscfg_seed)
+            d.set_state_callback(self.seeder_state_callback)
+
+        self._logger.debug("starting to wait for download to reach seeding state")
+
+        self.seeder_session = Session(self.seed_config, ignore_singleton=True)
+        self.seeder_session.prestart()
+        self.seeder_session.start().addCallback(start_seed_download)
+
+        return self.seeding_deferred
+
+    def stop_seeder(self):
+        if self.seeder_session is not None:
+            return self.seeder_session.shutdown()
+        return succeed(None)
+
+    def seeder_state_callback(self, ds):
+        d = ds.get_download()
+        self._logger.debug("seeder status: %s %s %s", repr(d.get_def().get_name()), dlstatus_strings[ds.get_status()],
+                           ds.get_progress())
+
+        if ds.get_status() == DLSTATUS_SEEDING:
+            self.seeding_deferred.callback(None)
+            return 0.0, False
+
+        return 1.0, False
 
     def assert_(self, boolean, reason=None, do_assert=True, tribler_session=None, dump_statistics=False):
         if not boolean:
             # print statistics if needed
             if tribler_session and dump_statistics:
-                self._print_statistics(tribler_session.get_statistics())
+                self._print_statistics(tribler_session.get_tribler_statistics())
+                self._print_statistics(tribler_session.get_dispersy_statistics())
+                self._print_statistics(tribler_session.get_community_statistics())
 
             self.quit()
             assert boolean, reason
@@ -331,244 +462,3 @@ class TestAsServer(AbstractServer):
 
     def quit(self):
         self.quitting = True
-
-
-class TestGuiAsServer(TestAsServer):
-
-    """
-    Parent class for testing the gui-side of Tribler
-    """
-
-    def __init__(self, *argv, **kwargs):
-        """
-
-        """
-        super(TestGuiAsServer, self).__init__(*argv, **kwargs)
-
-        self.wx_watchdog = None
-        self.twisted_watchdog = None
-
-    def setUp(self):
-        self.assertFalse(Session.has_instance(), 'A session instance is already present when setting up the test')
-        AbstractServer.setUp(self, annotate=False)
-
-        self.app = wx.GetApp()
-        if not self.app:
-            from Tribler.Main.vwxGUI.TriblerApp import TriblerApp
-            self.app = TriblerApp(redirect=False)
-
-        self.guiUtility = None
-        self.frame = None
-        self.lm = None
-        self.session = None
-
-        self.hadSession = False
-        self.quitting = False
-
-        self.asserts = []
-        self.annotate(self._testMethodName, start=True)
-
-        self.wx_watchdog = Event()
-        self.twisted_watchdog = Event()
-
-        def wx_watchdog_keepalive():
-            if self.wx_watchdog:
-                self.wx_watchdog.set()
-                wx.CallLater(500, wx_watchdog_keepalive)
-        wx_watchdog_keepalive()
-
-        def twisted_watchdog_keepalive():
-            if self.twisted_watchdog:
-                self.twisted_watchdog.set()
-                reactor.callLater(0.5, twisted_watchdog_keepalive)
-        reactor.callLater(0.5, twisted_watchdog_keepalive)
-
-        self.watchdog.register_event(self.wx_watchdog, "wx thread")
-        self.watchdog.register_event(self.twisted_watchdog, "twisted thread")
-
-    def assert_(self, boolean, reason, do_assert=True, tribler_session=None, dump_statistics=False):
-        if not boolean:
-            # print statistics if needed
-            if tribler_session and dump_statistics:
-                self._print_statistics(tribler_session.get_statistics())
-
-            self.screenshot("ASSERT: %s" % reason)
-            self.quit()
-
-            self.asserts.append((boolean, reason))
-
-            if do_assert:
-                assert boolean, reason
-
-    def startTest(self, callback, min_callback_delay=5, autoload_discovery=True,
-                  use_torrent_search=True, use_channel_search=True, allow_multiple=True):
-        from Tribler.Main.vwxGUI.GuiUtility import GUIUtility
-        from Tribler.Main import tribler_main
-
-        # Always start testing from the same dir (repo root)
-        os.chdir(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
-
-        tribler_main.ALLOW_MULTIPLE = allow_multiple
-
-        self.hadSession = False
-        starttime = time.time()
-
-        def call_callback():
-            # If at least min_callback_delay seconds have passed, call the
-            # callback, else schedule it's call for when that happens.
-            time_elapsed = time.time() - starttime
-            if time_elapsed > min_callback_delay:
-                callback()
-            else:
-                self.callLater(min_callback_delay - time_elapsed, callback)
-
-        def wait_for_frame():
-            self._logger.debug("GUIUtility ready, starting to wait for frame to be ready")
-            self.frame = self.guiUtility.frame
-            self.frame.Maximize()
-            self.CallConditional(30, lambda: self.frame.ready, call_callback)
-
-        def wait_for_init():
-            self._logger.debug("lm initcomplete, starting to wait for GUIUtility to be ready")
-            self.guiUtility = GUIUtility.getInstance()
-            self.CallConditional(30, lambda: self.guiUtility.registered, wait_for_frame)
-
-        def wait_for_guiutility():
-            self._logger.debug("waiting for guiutility instance")
-            self.lm = self.session.lm
-            self.CallConditional(30, lambda: GUIUtility.hasInstance(), wait_for_init)
-
-        def wait_for_instance():
-            self._logger.debug("found instance, starting to wait for lm to be initcomplete")
-            self.session = Session.get_instance()
-            self.hadSession = True
-            self.CallConditional(30, lambda: self.session.lm and self.session.lm.initComplete, wait_for_guiutility)
-
-        self._logger.debug("waiting for session instance")
-        self.CallConditional(30, Session.has_instance, lambda: TestAsServer.startTest(self, wait_for_instance))
-
-        # modify argv to let tribler think its running from a different directory
-        sys.argv = [os.path.abspath('./.exe')]
-        tribler_main.run(autoload_discovery=autoload_discovery,
-                         use_torrent_search=use_torrent_search,
-                         use_channel_search=use_channel_search)
-
-        assert self.hadSession, 'Did not even create a session'
-
-    def callLater(self, seconds, callback):
-        if not self.quitting:
-            if seconds:
-                wx.CallLater(seconds * 1000, callback)
-            elif not wx.Thread_IsMain():
-                wx.CallAfter(callback)
-            else:
-                callback()
-
-    def quit(self):
-        if self.frame:
-            self.frame.OnCloseWindow()
-
-        else:
-            def close_dialogs():
-                for item in wx.GetTopLevelWindows():
-                    if isinstance(item, wx.Dialog):
-                        if item.IsModal():
-                            item.EndModal(wx.ID_CANCEL)
-                        else:
-                            item.Destroy()
-                    else:
-                        item.Close()
-
-            def do_quit():
-                self.app.ExitMainLoop()
-                wx.WakeUpMainThread()
-
-            self.callLater(1, close_dialogs)
-            self.callLater(2, do_quit)
-            self.callLater(3, self.app.Exit)
-
-        self.quitting = True
-
-    def tearDown(self):
-        self.wx_watchdog = None
-        self.twisted_watchdog = None
-        self.watchdog.unregister_event("wx thread")
-        self.watchdog.unregister_event("twisted thread")
-
-        self.annotate(self._testMethodName, start=False)
-
-        """ unittest test tear down code """
-        del self.guiUtility
-        del self.frame
-        del self.lm
-        del self.session
-
-        time.sleep(1)
-        gc.collect()
-
-        ts = enumerate_threads()
-        if ts:
-            self._logger.debug("Number of threads still running %s", len(ts))
-            for t in ts:
-                self._logger.debug("Thread still running %s, daemon %s, instance: %s", t.getName(), t.isDaemon(), t)
-
-        dhtlog = os.path.join(self.state_dir, 'pymdht.log')
-        if os.path.exists(dhtlog):
-            self._logger.debug("Content of pymdht.log")
-            f = open(dhtlog, 'r')
-            for line in f:
-                line = line.strip()
-                if line:
-                    self._logger.debug("> %s", line)
-            f.close()
-            self._logger.debug("Finished printing content of pymdht.log")
-
-        AbstractServer.tearDown(self, annotate=False)
-
-        for boolean, reason in self.asserts:
-            assert boolean, reason
-
-    def screenshot(self, title=None, destdir=OUTPUT_DIR, window=None):
-        try:
-            from PIL import Image
-        except ImportError:
-            self._logger.error("Could not load PIL: not making screenshots")
-            return
-
-        if window is None:
-            app = wx.GetApp()
-            window = app.GetTopWindow()
-            if not window:
-                self._logger.error("Couldn't obtain top window and no window was passed as argument, bailing out")
-                return
-
-        rect = window.GetClientRect()
-        size = window.GetSize()
-        rect = wx.Rect(rect.x, rect.y, size.x, size.y)
-
-        screen = wx.WindowDC(window)
-        bmp = wx.EmptyBitmap(rect.GetWidth(), rect.GetHeight() + 30)
-
-        mem = wx.MemoryDC(bmp)
-        mem.Blit(0, 30, rect.GetWidth(), rect.GetHeight(), screen, rect.GetX(), rect.GetY())
-
-        titlerect = wx.Rect(0, 0, rect.GetWidth(), 30)
-        mem.DrawRectangleRect(titlerect)
-        if title:
-            mem.DrawLabel(title, titlerect, wx.ALIGN_CENTER_HORIZONTAL | wx.ALIGN_CENTER_VERTICAL)
-        del mem
-
-        myWxImage = wx.ImageFromBitmap(bmp)
-        im = Image.new('RGB', (myWxImage.GetWidth(), myWxImage.GetHeight()))
-        im.frombytes(myWxImage.GetData())
-
-        if not os.path.exists(destdir):
-            os.makedirs(destdir)
-        index = 1
-        filename = os.path.join(destdir, 'Screenshot-%.2d.png' % index)
-        while os.path.exists(filename):
-            index += 1
-            filename = os.path.join(destdir, 'Screenshot-%.2d.png' % index)
-        im.save(filename)
-
-        del bmp

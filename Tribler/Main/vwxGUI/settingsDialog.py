@@ -16,8 +16,7 @@ from Tribler.Core.Session import Session
 from Tribler.Core.SessionConfig import SessionStartupConfig
 from Tribler.Core.osutils import get_picture_dir
 from Tribler.Core.simpledefs import UPLOAD, DOWNLOAD
-from Tribler.Core.DownloadConfig import get_default_dscfg_filename
-from Tribler.Main.globals import DefaultDownloadStartupConfig
+from Tribler.Core.DownloadConfig import get_default_dscfg_filename, DefaultDownloadStartupConfig
 from Tribler.Main.vwxGUI.GuiImageManager import GuiImageManager, data2wxBitmap, ICON_MAX_DIM
 from Tribler.Main.vwxGUI.GuiUtility import GUIUtility
 from Tribler.Main.vwxGUI.validator import DirectoryValidator, NetworkSpeedValidator, NumberValidator
@@ -66,7 +65,7 @@ def add_label(parent, sizer, label):
 class SettingsDialog(wx.Dialog):
 
     def __init__(self):
-        super(SettingsDialog, self).__init__(None, size=(600, 600),
+        super(SettingsDialog, self).__init__(None, size=(600, 700),
                                              title="Settings", name="settingsDialog", style=wx.DEFAULT_DIALOG_STYLE)
         self.SetExtraStyle(self.GetExtraStyle() | wx.WS_EX_VALIDATE_RECURSIVELY)
         self._logger = logging.getLogger(self.__class__.__name__)
@@ -265,6 +264,15 @@ class SettingsDialog(wx.Dialog):
             except:
                 self._logger.exception("Could not set target")
 
+        for target in [scfg, self.utility.session]:
+            if target.get_watch_folder_enabled() != self._use_watch_folder.GetValue():
+                target.set_watch_folder_enabled(self._use_watch_folder.GetValue())
+                restart = True
+
+            if target.get_watch_folder_path() != self._wf_location_ctrl.GetValue():
+                target.set_watch_folder_path(self._wf_location_ctrl.GetValue())
+                restart = True
+
         seeding_mode = self.utility.read_config('seeding_mode', 'downloadconfig')
         for i, mode in enumerate(('ratio', 'forever', 'time', 'never')):
             if getattr(self, '_seeding%d' % i).GetValue():
@@ -304,6 +312,18 @@ class SettingsDialog(wx.Dialog):
             self.utility.session.set_libtorrent_utp(enable_utp)
             scfg.set_libtorrent_utp(enable_utp)
 
+        # Multichain
+        use_multichain = self._use_multichain.IsChecked()
+        if use_multichain != self.utility.session.get_enable_multichain():
+            scfg.set_enable_multichain(use_multichain)
+            restart = True
+
+        # Credit Mining
+        use_boosting = self._use_boosting.IsChecked()
+        if use_boosting != self.utility.session.get_creditmining_enable():
+            scfg.set_creditmining_enable(use_boosting)
+            restart = True
+
         scfg.save(cfgfilename)
 
         self.utility.flush_config()
@@ -332,14 +352,19 @@ class SettingsDialog(wx.Dialog):
             pass
         dlg.Destroy()
 
-    def BrowseClicked(self, event=None):
+    def BrowseDownloadLocationClicked(self, event=None):
         dlg = wx.DirDialog(None, "Choose download directory", style=wx.DEFAULT_DIALOG_STYLE)
         dlg.SetPath(self.defaultDLConfig.get_dest_dir())
         if dlg.ShowModal() == wx.ID_OK:
             self._disk_location_ctrl.SetForegroundColour(wx.BLACK)
             self._disk_location_ctrl.SetValue(dlg.GetPath())
-        else:
-            pass
+
+    def BrowseWatchFolderClicked(self, event=None):
+        dlg = wx.DirDialog(None, "Choose watch folder", style=wx.DEFAULT_DIALOG_STYLE)
+        dlg.SetPath(self.utility.session.get_watch_folder_path())
+        if dlg.ShowModal() == wx.ID_OK:
+            self._wf_location_ctrl.SetForegroundColour(wx.BLACK)
+            self._wf_location_ctrl.SetValue(dlg.GetPath())
 
     def ProxyTypeChanged(self, event=None):
         selection = self._lt_proxytype.GetStringSelection()
@@ -435,8 +460,8 @@ class SettingsDialog(wx.Dialog):
         gp_s2_hsizer = wx.BoxSizer(wx.HORIZONTAL)
         self._disk_location_ctrl = EditText(general_panel, validator=DirectoryValidator())
         gp_s2_hsizer.Add(self._disk_location_ctrl, 1, wx.ALIGN_CENTER_VERTICAL)
-        self._browse = wx.Button(general_panel, label="Browse")
-        gp_s2_hsizer.Add(self._browse)
+        self._browse_download_location = wx.Button(general_panel, label="Browse")
+        gp_s2_hsizer.Add(self._browse_download_location)
         gp_s2_sizer.Add(gp_s2_hsizer, 0, wx.EXPAND)
         self._disk_location_choice = wx.CheckBox(general_panel, label="Let me choose a location for every download")
         self._disk_location_choice.Bind(wx.EVT_CHECKBOX, self.OnChooseLocationChecked)
@@ -447,6 +472,24 @@ class SettingsDialog(wx.Dialog):
         self._default_anonymity_dialog = AnonymityDialog(general_panel)
         gp_s2_sizer.Add(self._default_anonymous_label, 0, wx.EXPAND)
         gp_s2_sizer.Add(self._default_anonymity_dialog, 0, wx.EXPAND)
+
+        # Settings related to the watch folder - the watch folder is a place where .torrent files can be put.
+        # They are automatically picked up by Tribler and added to the download queue if not there yet.
+        gp_s3_sizer = create_subsection(general_panel, gp_vsizer, "Watch Folder", 1)
+        self._use_watch_folder = wx.CheckBox(general_panel, label="Enable watch folder")
+        self._use_watch_folder.SetValue(self.utility.session.get_watch_folder_enabled())
+        gp_s3_sizer.Add(self._use_watch_folder, 0, wx.EXPAND)
+
+        gp_s3_wf_path_label = wx.StaticText(general_panel, label="Watch folder path:")
+        gp_s2_sizer.Add(gp_s3_wf_path_label)
+        gp_s3_wf_path_hsizer = wx.BoxSizer(wx.HORIZONTAL)
+        self._wf_location_ctrl = EditText(general_panel, validator=DirectoryValidator())
+        self._wf_location_ctrl.SetValue(self.utility.session.get_watch_folder_path())
+        gp_s3_wf_path_hsizer.Add(self._wf_location_ctrl, 1, wx.ALIGN_CENTER_VERTICAL)
+        self._browse_wf_location = wx.Button(general_panel, label="Browse")
+        self._browse_wf_location.Bind(wx.EVT_BUTTON, self.BrowseWatchFolderClicked)
+        gp_s3_wf_path_hsizer.Add(self._browse_wf_location)
+        gp_s3_sizer.Add(gp_s3_wf_path_hsizer, 0, wx.EXPAND)
 
         # Minimize
         if sys.platform == "darwin":
@@ -459,7 +502,7 @@ class SettingsDialog(wx.Dialog):
             gp_s3_sizer.Add(self._minimize_to_tray)
 
         self._edit.Bind(wx.EVT_BUTTON, self.EditClicked)
-        self._browse.Bind(wx.EVT_BUTTON, self.BrowseClicked)
+        self._browse_download_location.Bind(wx.EVT_BUTTON, self.BrowseDownloadLocationClicked)
 
         # nickname
         self._my_name_field.SetValue(self.utility.session.get_nickname())
@@ -700,6 +743,13 @@ class SettingsDialog(wx.Dialog):
             exp_panel, label="Tribler connects to Emercoin over its JSON-RPC API.\nThis requires you to enable it by editing the emercoin.conf file and setting\nserver=1, rpcport, rpcuser, rpcpassword, and rpcconnect.")
         exp_vsizer.Add(exp_s2_faq_text, 0, wx.EXPAND | wx.TOP, 10)
 
+        exp_s3_sizer = create_subsection(exp_panel, exp_vsizer, "Credit Mining", 1, 3)
+        boosting_text = wx.StaticText(exp_panel, -1, 'Credit Mining is a mechanism to boost your ratio by '
+                                                     '\nautomatically download and upload data.')
+        exp_s3_sizer.Add(boosting_text, 0, wx.EXPAND | wx.TOP, 5)
+        self._use_boosting = wx.CheckBox(exp_panel, label="Enable credit mining")
+        exp_s3_sizer.Add(self._use_boosting, 0, wx.EXPAND)
+
         # load values
         self._use_webui.SetValue(self.utility.read_config('use_webui'))
         self._webui_port.SetValue(str(self.utility.read_config('webui_port')))
@@ -709,6 +759,8 @@ class SettingsDialog(wx.Dialog):
         self._emc_port.SetValue(str(self.utility.read_config('emc_port')))
         self._emc_username.SetValue(self.utility.read_config('emc_username'))
         self._emc_password.SetValue(self.utility.read_config('emc_password'))
+
+        self._use_boosting.SetValue(self.utility.session.get_creditmining_enable())
 
         return exp_panel, item_id
 
@@ -768,9 +820,16 @@ class SettingsDialog(wx.Dialog):
         exp_s2_sizer.Add(proxytext, 0, wx.EXPAND | wx.BOTTOM, 10)
         exp_s2_sizer.Add(slider_sizer, 0, wx.EXPAND | wx.TOP | wx.BOTTOM, 5)
 
+        exp_s3_sizer = create_subsection(exp_panel, exp_vsizer, "Multichain", 1, 3)
+        multichain_text = wx.StaticText(exp_panel, -1, 'Multichain is a blockchain-based way to keep track of sharing ratio, and eventually prevent freeriding.\nIt is currently still in an early phase of development.')
+        exp_s3_sizer.Add(multichain_text, 0, wx.EXPAND | wx.TOP, 5)
+        self._use_multichain = wx.CheckBox(exp_panel, label="Enable multichain")
+        exp_s3_sizer.Add(self._use_multichain, 0, wx.EXPAND)
+
         # load values
         self._become_exitnode.SetValue(self.utility.session.get_tunnel_community_exitnode_enabled())
         self._sliderhops.SetValue(self.utility.read_config('default_number_hops'))
+        self._use_multichain.SetValue(self.utility.session.get_enable_multichain())
 
         return exp_panel, item_id
 

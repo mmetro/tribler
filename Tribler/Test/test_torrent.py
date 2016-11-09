@@ -4,15 +4,19 @@ import shutil
 import time
 import libtorrent
 
-from Tribler.Test.test_as_server import AbstractServer, TESTS_DATA_DIR
+from twisted.internet.defer import inlineCallbacks
 
+from Tribler.Test.test_as_server import AbstractServer, TESTS_DATA_DIR
 from Tribler.Core.Utilities.torrent_utils import create_torrent_file
+from Tribler.dispersy.util import blocking_call_on_reactor_thread
 
 
 class TestTorrent(AbstractServer):
 
+    @blocking_call_on_reactor_thread
+    @inlineCallbacks
     def setUp(self):
-        super(TestTorrent, self).setUp()
+        yield super(TestTorrent, self).setUp()
 
         self._ubuntu_torrent_name = u"ubuntu-15.04-desktop-amd64.iso.torrent"
         self._origin_torrent_path = os.path.join(TESTS_DATA_DIR, self._ubuntu_torrent_name)
@@ -34,7 +38,7 @@ class TestTorrent(AbstractServer):
         Tests the create_torrent_file() function.
         """
 
-        def on_torrent_created(result):
+        def _on_torrent_created(result):
             # start a libtorrent session to check if the file is correct
             lt_session = libtorrent.session()
             p = {'save_path': self._temp_dir,
@@ -48,5 +52,6 @@ class TestTorrent(AbstractServer):
             lt_session.remove_torrent(handle)
             del lt_session
 
-        params = {'': ''}
-        create_torrent_file([self._test_torrent_path], params, callback=on_torrent_created)
+        params = {}
+        result = create_torrent_file([self._test_torrent_path], params)
+        _on_torrent_created(result)

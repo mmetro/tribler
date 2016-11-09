@@ -21,8 +21,7 @@
 import sys
 from collections import OrderedDict
 
-from Tribler.Core.Video.defs import PLAYBACKMODE_INTERNAL
-
+from Tribler.Core.Video.defs import PLAYBACKMODE_EXTERNAL_DEFAULT
 
 DEFAULTPORT = 7760
 
@@ -35,9 +34,14 @@ DEFAULTPORT = 7760
 #  Version 4: remove swift
 #  Version 7: exitnode optin switch added
 #  Version 10: BarterCommunity settings added (disabled by default)
-# Version 11: Added a default whether we should upgrade or not.
+#  Version 11: Added a default whether we should upgrade or not.
+#  Version 12: Added watch folder options.
+#  Version 13: Added HTTP API options.
+#  Version 14: Added option to enable/disable channel, previewchannel and tunnel community.
+#  Version 15: Added credit mining options
+#  Version 16: Changed default VLC video player to external (due to the removal of the wx player).
 
-SESSDEFAULTS_VERSION = 11
+SESSDEFAULTS_VERSION = 16
 sessdefaults = OrderedDict()
 
 # General Tribler settings
@@ -67,6 +71,14 @@ sessdefaults['general']['live_aux_seeders'] = []
 sessdefaults['allchannel_community'] = OrderedDict()
 sessdefaults['allchannel_community']['enabled'] = True
 
+# Channel community section
+sessdefaults['channel_community'] = OrderedDict()
+sessdefaults['channel_community']['enabled'] = True
+
+# PreviewChannel community section
+sessdefaults['preview_channel_community'] = OrderedDict()
+sessdefaults['preview_channel_community']['enabled'] = True
+
 # Search community section
 sessdefaults['search_community'] = OrderedDict()
 sessdefaults['search_community']['enabled'] = True
@@ -75,6 +87,11 @@ sessdefaults['search_community']['enabled'] = True
 sessdefaults['tunnel_community'] = OrderedDict()
 sessdefaults['tunnel_community']['socks5_listen_ports'] = [-1] * 5
 sessdefaults['tunnel_community']['exitnode_enabled'] = False
+sessdefaults['tunnel_community']['enabled'] = True
+
+# Multichain community section
+sessdefaults['multichain'] = OrderedDict()
+sessdefaults['multichain']['enabled'] = True
 
 # Barter community section
 sessdefaults['barter_community'] = OrderedDict()
@@ -131,12 +148,38 @@ sessdefaults['video'] = OrderedDict()
 sessdefaults['video']['enabled'] = True
 sessdefaults['video']['path'] = None
 sessdefaults['video']['port'] = -1
-sessdefaults['video']['preferredmode'] = PLAYBACKMODE_INTERNAL
+sessdefaults['video']['preferredmode'] = PLAYBACKMODE_EXTERNAL_DEFAULT
 
 #Upgrader config
 sessdefaults['upgrader'] = OrderedDict()
 sessdefaults['upgrader']['enabled'] = True
 
+# Watch folder config
+sessdefaults['watch_folder'] = OrderedDict()
+sessdefaults['watch_folder']['enabled'] = False
+sessdefaults['watch_folder']['watch_folder_dir'] = None
+
+# HTTP API config
+sessdefaults['http_api'] = OrderedDict()
+sessdefaults['http_api']['enabled'] = False
+sessdefaults['http_api']['port'] = -1
+
+# Credit mining config
+sessdefaults['credit_mining'] = OrderedDict()
+sessdefaults['credit_mining']['enabled'] = False
+sessdefaults['credit_mining']['max_torrents_per_source'] = 20
+sessdefaults['credit_mining']['max_torrents_active'] = 50
+sessdefaults['credit_mining']['source_interval'] = 100
+sessdefaults['credit_mining']['swarm_interval'] = 100
+sessdefaults['credit_mining']['share_mode_target'] = 3
+sessdefaults['credit_mining']['tracker_interval'] = 200
+sessdefaults['credit_mining']['logging_interval'] = 60
+# By default we want to automatically boost legal-predetermined channel.
+sessdefaults['credit_mining']['boosting_sources'] = ["http://bt.etree.org/rss/bt_etree_org.rdf"]
+sessdefaults['credit_mining']['boosting_enabled'] = ["http://bt.etree.org/rss/bt_etree_org.rdf"]
+sessdefaults['credit_mining']['boosting_disabled'] = []
+sessdefaults['credit_mining']['archive_sources'] = []
+sessdefaults['credit_mining']['policy'] = "seederratio"
 
 #
 # BT per download opts
@@ -201,8 +244,6 @@ tribler_defaults['Tribler']['confirmonclose'] = 1
 # RateLimitPanel
 tribler_defaults['Tribler']['maxuploadrate'] = 0
 tribler_defaults['Tribler']['maxdownloadrate'] = 0
-# Misc
-tribler_defaults['Tribler']['torrentassociationwarned'] = 0
 # Anon tunnel
 tribler_defaults['Tribler']['default_number_hops'] = 1
 tribler_defaults['Tribler']['default_anonymity_enabled'] = True
@@ -223,8 +264,10 @@ tribler_defaults['Tribler']['emc_ip'] = '127.0.0.1'
 tribler_defaults['Tribler']['emc_port'] = '8332'
 tribler_defaults['Tribler']['emc_username'] = 'tribler'
 tribler_defaults['Tribler']['emc_password'] = 'tribler'
+# Misc
 tribler_defaults['Tribler']['showsaveas'] = 1
 tribler_defaults['Tribler']['i2ilistenport'] = 57891
 tribler_defaults['Tribler']['mintray'] = 2 if sys.platform == 'win32' else 0
 tribler_defaults['Tribler']['free_space_threshold'] = 100 * 1024 * 1024
 tribler_defaults['Tribler']['version_info'] = {}
+tribler_defaults['Tribler']['last_reported_version'] = None

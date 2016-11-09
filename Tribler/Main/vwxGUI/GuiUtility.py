@@ -2,27 +2,25 @@
 # Modified by Niels Zeilemaker, Laurens Versluis
 # see LICENSE.txt for license information
 
-import wx
 import os
 import sys
 import json
 import logging
 from time import time
+from threading import Lock
+
+import wx
 
 from Tribler import LIBRARYNAME
-
-from Tribler.Category.Category import Category
+from Tribler.Core.Category.Category import Category
 from Tribler.Core.CacheDB.sqlitecachedb import forceDBThread
 from Tribler.Core.Utilities.search_utils import split_into_keywords
-
 from Tribler.Core.simpledefs import NTFY_STARTUP_TICK, NTFY_CREATE, NTFY_DELETE, NTFY_CLOSE_TICK, NTFY_INSERT
 from Tribler.Main.Utility.GuiDBHandler import startWorker, GUI_PRI_DISPERSY
 from Tribler.Main.Utility.GuiDBTuples import RemoteChannel
-
 from Tribler.Main.vwxGUI import forceWxThread
 from Tribler.Main.vwxGUI.SearchGridManager import TorrentManager, ChannelManager, LibraryManager
 from Tribler.Main.vwxGUI.GuiImageManager import GuiImageManager
-from threading import Lock
 from Tribler.Main.vwxGUI.gaugesplash import GaugeSplash
 
 
@@ -120,8 +118,6 @@ class GUIUtility(object):
             self.torrentsearch_manager.connect(self.utility.session, self.library_manager, self.channelsearch_manager)
             self.channelsearch_manager.connect(self.utility.session, self.library_manager, self.torrentsearch_manager)
             self.library_manager.connect(self.utility.session, self.torrentsearch_manager, self.channelsearch_manager)
-
-            self.videoplayer = self.utility.session.lm.videoplayer
         else:
             raise RuntimeError('GuiUtility is already registered')
 
@@ -156,7 +152,7 @@ class GUIUtility(object):
             if len(self.oldpage) > 3:
                 self.oldpage.pop(0)
 
-            self.frame.Freeze()
+            #self.frame.Freeze()
 
             if page not in ['search_results', 'my_files', 'selectedchannel', 'playlist', 'channels']:
                 self.frame.splitter.Show(False)
@@ -250,6 +246,12 @@ class GUIUtility(object):
                 # Hide list
                 self.frame.librarylist.Show(False)
 
+            if page == 'creditmining':
+                self.frame.creditminingpanel.Show(True)
+
+            elif self.guiPage == 'creditmining':
+                self.frame.creditminingpanel.Show(False)
+
             if page == 'home':
                 self.frame.home.ResetSearchBox()
                 self.frame.home.Show()
@@ -274,7 +276,7 @@ class GUIUtility(object):
 
             self.guiPage = page
             self.frame.Layout()
-            self.frame.Thaw()
+            #self.frame.Thaw()
 
         # Set focus to page
         if page == 'search_results':
@@ -356,6 +358,9 @@ class GUIUtility(object):
         if self.guiPage == 'my_files':
             return self.frame.librarylist
 
+        if self.guiPage == 'creditmining':
+            return self.frame.creditminingpanel
+
     def SetTopSplitterWindow(self, window=None, show=True):
         while self.frame.splitter_top.GetChildren():
             self.frame.splitter_top.Detach(0)
@@ -368,7 +373,7 @@ class GUIUtility(object):
         self.frame.splitter_top_window.Refresh()
 
     def SetBottomSplitterWindow(self, panel_type):
-        self.frame.splitter_bottom_window.Freeze()
+        #self.frame.splitter_bottom_window.Freeze()
 
         from Tribler.Main.vwxGUI.list_details import TorrentDetails, ChannelInfoPanel, LibraryDetails, ChannelDetails, PlaylistDetails, SearchInfoPanel, LibraryInfoPanel, SelectedchannelInfoPanel, PlaylistInfoPanel
 
@@ -390,7 +395,7 @@ class GUIUtility(object):
         if self.guiPage not in ['mychannel', 'home']:
             self.frame.splitter.Show(True)
         self.frame.splitter_bottom.Layout()
-        self.frame.splitter_bottom_window.Thaw()
+        #self.frame.splitter_bottom_window.Thaw()
         self.frame.splitter_bottom_window.Refresh()
         return result
 
@@ -481,7 +486,7 @@ class GUIUtility(object):
                 self.current_search_query = keywords
                 self._logger.debug("GUIUtil: searchFiles: %s %s", keywords, time())
 
-                self.frame.searchlist.Freeze()
+                #self.frame.searchlist.Freeze()
 
                 self.torrentsearch_manager.setSearchKeywords(keywords)
                 self.channelsearch_manager.setSearchKeywords(keywords)
@@ -495,7 +500,7 @@ class GUIUtility(object):
                 self.ShowPage('search_results', keywords)
 
                 # We now have to call thaw, otherwise loading message will not be shown.
-                self.frame.searchlist.Thaw()
+                #self.frame.searchlist.Thaw()
 
                 # Peform local search
                 self.torrentsearch_manager.set_gridmgr(self.frame.searchlist.GetManager())
@@ -595,7 +600,8 @@ class GUIUtility(object):
             'selectedchannel': self.frame.selectedchannellist,
             'mychannel': self.frame.managechannel,
             'search_results': self.frame.searchlist,
-            'my_files': self.frame.librarylist}
+            'my_files': self.frame.librarylist,
+            'creditmining': self.frame.creditminingpanel}
         if self.guiPage in lists and lists[self.guiPage].HasFocus():
             lists[self.guiPage].ScrollToEnd(goto_end)
         elif event:
@@ -607,7 +613,8 @@ class GUIUtility(object):
             'selectedchannel': self.frame.selectedchannellist,
             'mychannel': self.frame.managechannel,
             'search_results': self.frame.searchlist,
-            'my_files': self.frame.librarylist}
+            'my_files': self.frame.librarylist,
+            'creditmining': self.frame.creditminingpanel}
         if self.guiPage in lists:
             lists[self.guiPage].ScrollToId(id)
 
@@ -637,7 +644,7 @@ class GUIUtility(object):
         if newState is None:
             newState = not self.getFamilyFilter()
 
-        Category.getInstance().set_family_filter(newState)
+        self.utility.session.lm.category.set_family_filter(newState)
         for l in self.lists:
             if getattr(l, 'GotFilter', False):
                 l.GotFilter(None)
@@ -654,7 +661,7 @@ class GUIUtility(object):
         self.utility.flush_config()
 
     def getFamilyFilter(self):
-        catobj = Category.getInstance()
+        catobj = self.utility.session.lm.category
         return catobj.family_filter_enabled()
 
     def set_firewall_restart(self, b):

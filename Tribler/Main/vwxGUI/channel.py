@@ -1,6 +1,4 @@
 # Written by Niels Zeilemaker
-import wx
-
 import os
 import sys
 from time import time
@@ -10,13 +8,13 @@ from traceback import print_exc
 import re
 from binascii import hexlify
 
+import wx
+
 from Tribler.Main.vwxGUI.GuiUtility import GUIUtility, forceWxThread
 from Tribler.Main.vwxGUI.widgets import _set_font, NotebookPanel, SimpleNotebook, EditText, BetterText
-
-from Tribler.Category.Category import Category
+from Tribler.Core.Category.Category import Category
 from Tribler.Core.TorrentDef import TorrentDef
 from Tribler.Core.CacheDB.sqlitecachedb import forceDBThread
-
 from Tribler.Main.vwxGUI import (CHANNEL_MAX_NON_FAVORITE, warnWxThread, LIST_GREY, LIST_LIGHTBLUE, LIST_DESELECTED,
                                  DEFAULT_BACKGROUND, format_time, showError)
 from Tribler.Main.vwxGUI.list import BaseManager, GenericSearchList, SizeList, List
@@ -31,11 +29,9 @@ from Tribler.Main.vwxGUI.list_item import (PlaylistItem, ColumnsManager, DragIte
                                            ModificationItem, ModerationItem, ThumbnailListItem)
 from Tribler.Main.vwxGUI.list_details import (AbstractDetails, SelectedchannelInfoPanel, PlaylistDetails,
                                               PlaylistInfoPanel, TorrentDetails, MyChannelPlaylist)
-
 from Tribler.Main.Utility.GuiDBHandler import startWorker, cancelWorker, GUI_PRI_DISPERSY
 from Tribler.community.channel.community import ChannelCommunity
 from Tribler.Main.Utility.GuiDBTuples import Torrent, CollectedTorrent, ChannelTorrent
-
 from Tribler.Main.Dialogs.AddTorrent import AddTorrent
 
 
@@ -256,7 +252,7 @@ class SelectedChannelList(GenericSearchList):
         ColumnsManager.getInstance().setColumns(PlaylistItem, columns)
 
         self.category_names = {}
-        for key, name in Category.getInstance().getCategoryNames(filter=False):
+        for key, name in self.session.lm.category.getCategoryNames(filter=False):
             self.category_names[key] = name
         self.category_names[None] = 'Unknown'
 
@@ -352,14 +348,14 @@ class SelectedChannelList(GenericSearchList):
             return True
         return False
 
-    def SetGrid(self, enable):
-        self.display_grid = enable
+    def ToggleGrid(self):
+        self.display_grid = not self.display_grid
 
         new_raw_data = []
         for data in (self.list.raw_data or []):
-            if enable and (len(data) < 4 or data[3] == TorrentListItem):
+            if self.display_grid and (len(data) < 4 or data[3] == TorrentListItem):
                 new_raw_data.append(list(data[:3]) + [ThumbnailListItem])
-            elif not enable and data[3] == ThumbnailListItem:
+            elif not self.display_grid and data[3] == ThumbnailListItem:
                 new_raw_data.append(list(data[:3]) + [TorrentListItem])
         self.list.SetData(new_raw_data)
         self.list.SetGrid(self.display_grid)
@@ -1536,6 +1532,9 @@ class ManageChannel(AbstractDetails):
         my_channel_object.remove_rss_feed(item.url)
 
     def OnRefreshRss(self, event):
+        my_channel_object = self.guiutility.utility.session.lm.channel_manager.get_my_channel(self.channel.id)
+        my_channel_object.refresh_all_feeds()
+
         button = event.GetEventObject()
         button.Enable(False)
         wx.CallLater(5000, button.Enable, True)
@@ -1843,7 +1842,7 @@ class ManageChannelPlaylistList(ManageChannelFilesList):
         dlg.availableList = wx.ListBox(dlg, choices=available_names, style=wx.LB_MULTIPLE)
         dlg.availableList.SetMinSize((1, -1))
 
-        sizer = wx.FlexGridSizer(2, 3, 3, 3)
+        sizer = wx.FlexGridSizer(3, 3, 3, 3)
         sizer.AddGrowableRow(1)
         sizer.AddGrowableCol(0, 1)
         sizer.AddGrowableCol(2, 1)

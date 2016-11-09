@@ -8,7 +8,8 @@
 #
 # see LICENSE.txt for license information
 #
-
+from Tribler.Core.Modules.process_checker import ProcessChecker
+from Tribler.Main.Dialogs.NewVersionDialog import NewVersionDialog
 
 try:
     import prctl
@@ -23,48 +24,40 @@ from Tribler.Core.Utilities.twisted_thread import reactor
 import logging
 import os
 import sys
-import tempfile
 import traceback
-import urllib2
 from collections import defaultdict
 from random import randint
 from traceback import print_exc
 
 import wx
+from twisted.internet.task import LoopingCall
+from twisted.internet.threads import deferToThread
 from twisted.python.threadable import isInIOThread
 
-from Tribler.Category.Category import Category
-from Tribler.Core.DownloadConfig import get_default_dest_dir, get_default_dscfg_filename
+from Tribler.Core.DownloadConfig import get_default_dest_dir, get_default_dscfg_filename, DefaultDownloadStartupConfig
 from Tribler.Core.Session import Session
 from Tribler.Core.SessionConfig import SessionStartupConfig
-from Tribler.Core.Video.VideoPlayer import PLAYBACKMODE_INTERNAL, return_feasible_playback_modes
-from Tribler.Core.osutils import get_free_space
-from Tribler.Core.simpledefs import (DLSTATUS_DOWNLOADING, DLSTATUS_SEEDING, DLSTATUS_STOPPED,
-                                     DLSTATUS_STOPPED_ON_ERROR, DOWNLOAD, NTFY_ACTIVITIES, NTFY_CHANNELCAST,
-                                     NTFY_COMMENTS, NTFY_CREATE, NTFY_DELETE, NTFY_DISPERSY, NTFY_FINISHED, NTFY_INSERT,
+from Tribler.Core.osutils import get_free_space, get_home_dir
+from Tribler.Core.simpledefs import (DLSTATUS_DOWNLOADING, DLSTATUS_SEEDING, DLSTATUS_STOPPED_ON_ERROR, DOWNLOAD, NTFY_ACTIVITIES, NTFY_CHANNELCAST,
+                                     NTFY_COMMENTS, NTFY_CREATE, NTFY_DELETE, NTFY_FINISHED, NTFY_INSERT,
                                      NTFY_MAGNET_CLOSE, NTFY_MAGNET_GOT_PEERS, NTFY_MAGNET_STARTED, NTFY_MARKINGS,
                                      NTFY_MODERATIONS, NTFY_MODIFICATIONS, NTFY_MODIFIED, NTFY_MYPREFERENCES,
                                      NTFY_PLAYLISTS, NTFY_REACHABLE, NTFY_STARTED, NTFY_STATE, NTFY_TORRENTS,
-                                     NTFY_UPDATE, NTFY_VOTECAST, UPLOAD, dlstatus_strings, STATEDIR_GUICONFIG,
-                                     NTFY_STARTUP_TICK, NTFY_CLOSE_TICK, NTFY_UPGRADER)
+                                     NTFY_UPDATE, NTFY_VOTECAST, UPLOAD, dlstatus_strings, NTFY_STARTUP_TICK,
+                                     NTFY_CLOSE_TICK, NTFY_UPGRADER, NTFY_WATCH_FOLDER_CORRUPT_TORRENT,
+                                     NTFY_NEW_VERSION)
 from Tribler.Core.version import commit_id, version_id
 from Tribler.Main.Dialogs.FeedbackWindow import FeedbackWindow
 from Tribler.Main.Utility.GuiDBHandler import GUIDBProducer, startWorker
-from Tribler.Main.Utility.compat import (convertDefaultDownloadConfig, convertDownloadCheckpoints, convertMainConfig,
-                                         convertSessionConfig)
 from Tribler.Core.Utilities.install_dir import determine_install_dir
 from Tribler.Main.Utility.utility import Utility, get_download_upload_speed
-from Tribler.Main.globals import DefaultDownloadStartupConfig
 from Tribler.Main.vwxGUI.GuiImageManager import GuiImageManager
 from Tribler.Main.vwxGUI.GuiUtility import GUIUtility, forceWxThread
 from Tribler.Main.vwxGUI.MainFrame import MainFrame
-from Tribler.Main.vwxGUI.MainVideoFrame import VideoDummyFrame
 from Tribler.Main.vwxGUI.TriblerApp import TriblerApp
 from Tribler.Main.vwxGUI.TriblerUpgradeDialog import TriblerUpgradeDialog
-from Tribler.Utilities.Instance2Instance import Instance2InstanceClient, Instance2InstanceServer
-from Tribler.Utilities.SingleInstanceChecker import SingleInstanceChecker
-from Tribler.dispersy.util import attach_profiler, call_on_reactor_thread
-
+from Tribler.dispersy.taskmanager import TaskManager
+from Tribler.dispersy.util import attach_profiler, blockingCallFromThread
 
 logger = logging.getLogger(__name__)
 
@@ -86,10 +79,11 @@ ALLOW_MULTIPLE = os.environ.get("TRIBLER_ALLOW_MULTIPLE", "False").lower() == "t
 #
 
 
-class ABCApp(object):
+class ABCApp(TaskManager):
 
     def __init__(self, params, installdir, autoload_discovery=True,
                  use_torrent_search=True, use_channel_search=True):
+        super(ABCApp, self).__init__()
         assert not isInIOThread(), "isInIOThread() seems to not be working correctly"
         self._logger = logging.getLogger(self.__class__.__name__)
 
@@ -137,7 +131,6 @@ class ABCApp(object):
 
             session.notifier.notify(NTFY_STARTUP_TICK, NTFY_INSERT, None, 'Starting API')
             wx.Yield()
-            s = self.startAPI(session)
 
             self._logger.info('Tribler Version: %s Build: %s', version_id, commit_id)
 
@@ -150,17 +143,14 @@ class ABCApp(object):
 
             session.notifier.notify(NTFY_STARTUP_TICK, NTFY_INSERT, None, 'Starting session and upgrading database (it may take a while)')
             wx.Yield()
-            s.start()
-            self.dispersy = s.lm.dispersy
 
-            session.notifier.notify(NTFY_STARTUP_TICK, NTFY_INSERT, None, 'Loading userdownloadchoice')
-            wx.Yield()
-            from Tribler.Main.vwxGUI.UserDownloadChoice import UserDownloadChoice
-            UserDownloadChoice.get_singleton().set_utility(self.utility)
+            session.start()
+            self.dispersy = session.lm.dispersy
+            self.dispersy.attach_progress_handler(self.progressHandler)
 
             session.notifier.notify(NTFY_STARTUP_TICK, NTFY_INSERT, None, 'Initializing Family Filter')
             wx.Yield()
-            cat = Category.getInstance()
+            cat = session.lm.category
 
             state = self.utility.read_config('family_filter')
             if state in (1, 0):
@@ -181,30 +171,23 @@ class ABCApp(object):
             maxup = self.utility.read_config('maxuploadrate')
             maxdown = self.utility.read_config('maxdownloadrate')
             # set speed limits using LibtorrentMgr
-            s.set_max_upload_speed(maxup)
-            s.set_max_download_speed(maxdown)
+            session.set_max_upload_speed(maxup)
+            session.set_max_download_speed(maxdown)
 
             # Only allow updates to come in after we defined ratelimiter
             self.prevActiveDownloads = []
-            s.set_download_states_callback(self.sesscb_states_callback)
+            session.set_download_states_callback(self.sesscb_states_callback)
 
             # Schedule task for checkpointing Session, to avoid hash checks after
             # crashes.
-            startWorker(consumer=None, workerFn=self.guiservthread_checkpoint_timer, delay=SESSION_CHECKPOINT_INTERVAL)
-
-            if not ALLOW_MULTIPLE:
-                # Put it here so an error is shown in the startup-error popup
-                # Start server for instance2instance communication
-                self.i2i_server = Instance2InstanceServer(self.utility.read_config('i2ilistenport'))
-                self.i2i_server.start(self.i2ithread_readlinecallback)
+            self.register_task("checkpoint_loop", LoopingCall(self.guiservthread_checkpoint_timer))\
+                .start(SESSION_CHECKPOINT_INTERVAL, now=False)
 
             session.notifier.notify(NTFY_STARTUP_TICK, NTFY_INSERT, None, 'GUIUtility register')
             wx.Yield()
             self.guiUtility.register()
 
-            self.frame = MainFrame(self,
-                                   None,
-                                   PLAYBACKMODE_INTERNAL in return_feasible_playback_modes())
+            self.frame = MainFrame(self, None, False)
             self.frame.SetIcon(wx.Icon(os.path.join(self.installdir, 'Tribler',
                                                     'Main', 'vwxGUI', 'images',
                                                     'tribler.ico'),
@@ -212,10 +195,6 @@ class ABCApp(object):
 
             # Arno, 2011-06-15: VLC 1.1.10 pops up separate win, don't have two.
             self.frame.videoframe = None
-            if PLAYBACKMODE_INTERNAL in return_feasible_playback_modes():
-                vlcwrap = s.lm.videoplayer.get_vlcwrap()
-                wx.CallLater(3000, vlcwrap._init_vlc)
-                self.frame.videoframe = VideoDummyFrame(self.frame.videoparentpanel, self.utility, vlcwrap)
 
             if sys.platform == 'win32':
                 wx.CallAfter(self.frame.top_bg.Refresh)
@@ -242,7 +221,8 @@ class ABCApp(object):
             session.notifier.notify(NTFY_STARTUP_TICK, NTFY_DELETE, None, None)
             wx.Yield()
             self.frame.Show(True)
-            session.lm.threadpool.call_in_thread(0, self.guiservthread_free_space_check)
+            self.register_task('free_space_check', LoopingCall(self.guiservthread_free_space_check))\
+                .start(FREE_SPACE_CHECK_INTERVAL)
 
             self.webUI = None
             if self.utility.read_config('use_webui'):
@@ -294,18 +274,15 @@ class ABCApp(object):
         cfgfilename = Session.get_default_config_filename(state_dir)
 
         self._logger.debug(u"Session config %s", cfgfilename)
-        try:
-            self.sconfig = SessionStartupConfig.load(cfgfilename)
-        except:
-            try:
-                self.sconfig = convertSessionConfig(os.path.join(state_dir, 'sessconfig.pickle'), cfgfilename)
-                convertMainConfig(state_dir, os.path.join(state_dir, 'abc.conf'),
-                                  os.path.join(state_dir, STATEDIR_GUICONFIG))
-            except:
-                self.sconfig = SessionStartupConfig()
-                self.sconfig.set_state_dir(state_dir)
 
+        self.sconfig = SessionStartupConfig.load(cfgfilename)
         self.sconfig.set_install_dir(self.installdir)
+
+        if not self.sconfig.get_watch_folder_path():
+            default_watch_folder_dir = os.path.join(get_home_dir(), u'Downloads', u'TriblerWatchFolder')
+            self.sconfig.set_watch_folder_path(default_watch_folder_dir)
+            if not os.path.exists(default_watch_folder_dir):
+                os.makedirs(default_watch_folder_dir)
 
         # TODO(emilon): Do we still want to force limit this? With the new
         # torrent store it should be pretty fast even with more that that.
@@ -315,14 +292,11 @@ class ABCApp(object):
 
         dlcfgfilename = get_default_dscfg_filename(self.sconfig.get_state_dir())
         self._logger.debug("main: Download config %s", dlcfgfilename)
-        try:
+
+        if os.path.exists(dlcfgfilename):
             defaultDLConfig = DefaultDownloadStartupConfig.load(dlcfgfilename)
-        except:
-            try:
-                defaultDLConfig = convertDefaultDownloadConfig(
-                    os.path.join(state_dir, 'dlconfig.pickle'), dlcfgfilename)
-            except:
-                defaultDLConfig = DefaultDownloadStartupConfig.getInstance()
+        else:
+            defaultDLConfig = DefaultDownloadStartupConfig.getInstance()
 
         if not defaultDLConfig.get_dest_dir():
             defaultDLConfig.set_dest_dir(get_default_dest_dir())
@@ -400,57 +374,14 @@ class ABCApp(object):
         s.add_observer(self.sesscb_ntfy_torrentfinished, NTFY_TORRENTS, [NTFY_FINISHED])
         s.add_observer(self.sesscb_ntfy_magnet,
                        NTFY_TORRENTS, [NTFY_MAGNET_GOT_PEERS, NTFY_MAGNET_STARTED, NTFY_MAGNET_CLOSE])
+        s.add_observer(self.sesscb_ntfy_corrupt_torrent, NTFY_WATCH_FOLDER_CORRUPT_TORRENT, [NTFY_INSERT])
+        s.add_observer(self.sesscb_ntfy_newversion, NTFY_NEW_VERSION, [NTFY_INSERT])
+
+        # Check for a new version
+        s.lm.version_check_manager.start(24 * 3600)
 
         # TODO(emilon): Use the LogObserver I already implemented
         # self.dispersy.callback.attach_exception_handler(self.frame.exceptionHandler)
-
-        startWorker(None, self.loadSessionCheckpoint, delay=5.0, workerType="ThreadPool")
-
-    def startAPI(self, session):
-        @call_on_reactor_thread
-        def define_communities(*args):
-            assert isInIOThread()
-            from Tribler.community.channel.community import ChannelCommunity
-            from Tribler.community.channel.preview import PreviewChannelCommunity
-            from Tribler.community.tunnel.tunnel_community import TunnelSettings
-            from Tribler.community.tunnel.hidden_community import HiddenTunnelCommunity
-
-            # make sure this is only called once
-            session.remove_observer(define_communities)
-
-            dispersy = session.get_dispersy_instance()
-
-            self._logger.info("tribler: Preparing communities...")
-            now = time()
-
-            dispersy.attach_progress_handler(self.progressHandler)
-
-            default_kwargs = {'tribler_session': session}
-            # must be called on the Dispersy thread
-            if session.get_barter_community_enabled():
-                from Tribler.community.bartercast4.community import BarterCommunity
-                dispersy.define_auto_load(BarterCommunity, session.dispersy_member, load=True)
-
-            # load metadata community
-            dispersy.define_auto_load(ChannelCommunity, session.dispersy_member, load=True, kargs=default_kwargs)
-            dispersy.define_auto_load(PreviewChannelCommunity, session.dispersy_member, kargs=default_kwargs)
-
-            keypair = dispersy.crypto.generate_key(u"curve25519")
-            dispersy_member = dispersy.get_member(private_key=dispersy.crypto.key_to_bin(keypair),)
-            settings = TunnelSettings(session.get_install_dir(), tribler_session=session)
-            tunnel_kwargs = {'tribler_session': session, 'settings': settings}
-
-            self.tunnel_community = dispersy.define_auto_load(HiddenTunnelCommunity, dispersy_member, load=True,
-                                                              kargs=tunnel_kwargs)[0]
-
-            session.set_anon_proxy_settings(2, ("127.0.0.1", session.get_tunnel_community_socks5_listen_ports()))
-
-            diff = time() - now
-            self._logger.info("tribler: communities are ready in %.2f seconds", diff)
-
-        session.add_observer(define_communities, NTFY_DISPERSY, [NTFY_STARTED])
-
-        return session
 
     @forceWxThread
     def sesscb_ntfy_myprefupdates(self, subject, changeType, objectID, *args):
@@ -523,7 +454,7 @@ class ABCApp(object):
 
     def sesscb_states_callback(self, dslist):
         if not self.ready:
-            return 5.0, []
+            return []
 
         # update tray icon
         total_download, total_upload = get_download_upload_speed(dslist)
@@ -605,10 +536,14 @@ class ABCApp(object):
 
                         # TODO(emilon): That's a hack to work around the fact
                         # that removing a torrent is racy.
-                        self.utility.session.lm.threadpool.call(0.5,
-                                                                reactor.callInThread,
-                                                                self.utility.session.start_download_from_tdef,
-                                                                tdef, dscfg)
+                        def schedule_download():
+                            self.register_task(
+                                "reschedule_dowload", reactor.callLater(5,
+                                                                        reactor.callInThread,
+                                                                        self.utility.session.start_download_from_tdef,
+                                                                        tdef, dscfg))
+
+                        reactor.callFromThread(schedule_download)
 
             self.prevActiveDownloads = newActiveDownloads
             if doCheckpoint:
@@ -617,8 +552,7 @@ class ABCApp(object):
             if self.utility.read_config(u'seeding_mode') == 'never':
                 for data in seeding_download_list:
                     data[u'download'].stop()
-                    from Tribler.Main.vwxGUI.UserDownloadChoice import UserDownloadChoice
-                    UserDownloadChoice.get_singleton().set_download_state(data[u'infohash'], "stop")
+                    self.utility.session.tribler_config.set_download_state(data[u'infohash'], "stop")
 
             # Adjust speeds and call TunnelCommunity.monitor_downloads once every 4 seconds
             adjustspeeds = False
@@ -631,28 +565,10 @@ class ABCApp(object):
         except:
             print_exc()
 
-        return 1.0, wantpeers
+        return wantpeers
 
-    def loadSessionCheckpoint(self):
-        pstate_dir = self.utility.session.get_downloads_pstate_dir()
-
-        filelist = os.listdir(pstate_dir)
-        if any([filename.endswith('.pickle') for filename in filelist]):
-            convertDownloadCheckpoints(pstate_dir)
-
-        from Tribler.Main.vwxGUI.UserDownloadChoice import UserDownloadChoice
-        user_download_choice = UserDownloadChoice.get_singleton()
-        initialdlstatus_dict = {}
-        for infohash, state in user_download_choice.get_download_states().iteritems():
-            if state == 'stop':
-                initialdlstatus_dict[infohash] = DLSTATUS_STOPPED
-
-        self.utility.session.load_checkpoint(initialdlstatus_dict=initialdlstatus_dict)
-
+    @forceWxThread
     def guiservthread_free_space_check(self):
-        if not (self and self.frame and self.frame.SRstatusbar):
-            return
-
         free_space = get_free_space(DefaultDownloadStartupConfig.getInstance().get_dest_dir())
         self.frame.SRstatusbar.RefreshFreeSpace(free_space)
 
@@ -676,19 +592,10 @@ class ABCApp(object):
             wx.CallAfter(wx.MessageBox, "Tribler has detected low disk space. Related downloads have been stopped.",
                          "Error")
 
-        self.utility.session.lm.threadpool.call_in_thread(FREE_SPACE_CHECK_INTERVAL, self.guiservthread_free_space_check)
-
     def guiservthread_checkpoint_timer(self):
         """ Periodically checkpoint Session """
-        if self.done:
-            return
-        try:
-            self._logger.info("main: Checkpointing Session")
-            self.utility.session.checkpoint()
-
-            self.utility.session.lm.threadpool.call_in_thread(SESSION_CHECKPOINT_INTERVAL, self.guiservthread_checkpoint_timer)
-        except:
-            print_exc()
+        self._logger.info("main: Checkpointing Session")
+        return deferToThread(self.utility.session.checkpoint)
 
     @forceWxThread
     def sesscb_ntfy_activities(self, events):
@@ -754,6 +661,10 @@ class ABCApp(object):
                 manager = self.frame.librarylist.GetManager()
                 manager.torrentsUpdated(infohashes)
 
+                if self.utility.session.get_creditmining_enable():
+                    manager = self.frame.creditminingpanel.cmlist.GetManager()
+                    manager.torrents_updated(infohashes)
+
             from Tribler.Main.Utility.GuiDBTuples import CollectedTorrent
 
             if self.frame.torrentdetailspanel.torrent and self.frame.torrentdetailspanel.torrent.infohash in infohashes:
@@ -775,8 +686,25 @@ class ABCApp(object):
         if self._frame_and_ready():
             infohash = objectID
             torrent = self.guiUtility.torrentsearch_manager.getTorrentByInfohash(infohash)
-            self.guiUtility.library_manager.addDownloadState(torrent)
+            # Check if we got the actual torrent as the bandwidth investor
+            # downloads aren't going to be there.
+            if torrent:
+                self.guiUtility.library_manager.addDownloadState(torrent)
 
+    @forceWxThread
+    def sesscb_ntfy_newversion(self, subject, changeType, objectID, *args):
+        if str(self.utility.read_config('last_reported_version')) == args[0]:
+            return
+
+        new_version_dialog = NewVersionDialog(args[0], self.frame, 'new_version_dialog', 'New version available',
+                                              title='New version',
+                                              msg="Version %s of Tribler is available. "
+                                                  "Do you want to visit the website to download the newest version?"
+                                                  % args[0])
+        new_version_dialog.ShowModal()
+        new_version_dialog.Destroy()
+
+    @forceWxThread
     def sesscb_ntfy_magnet(self, subject, changetype, objectID, *args):
         if changetype == NTFY_MAGNET_STARTED:
             self.guiUtility.library_manager.magnet_started(objectID)
@@ -784,6 +712,15 @@ class ABCApp(object):
             self.guiUtility.library_manager.magnet_got_peers(objectID, args[0])
         elif changetype == NTFY_MAGNET_CLOSE:
             self.guiUtility.library_manager.magnet_close(objectID)
+
+    @forceWxThread
+    def sesscb_ntfy_corrupt_torrent(self, subject, changetype, objectID, *args):
+        dlg = wx.MessageDialog(self.frame,
+                               "Unable to add corrupt torrent in watch folder to downloads: %s" % args[0],
+                               "Corrupt torrent",
+                               wx.OK | wx.ICON_ERROR)
+        dlg.ShowModal()
+        dlg.Destroy()
 
     @forceWxThread
     def sesscb_ntfy_playlistupdates(self, subject, changeType, objectID, *args):
@@ -848,6 +785,8 @@ class ABCApp(object):
     def OnExit(self):
         self.utility.session.notifier.notify(NTFY_CLOSE_TICK, NTFY_CREATE, None, None)
 
+        blockingCallFromThread(reactor, self.cancel_all_pending_tasks)
+
         if self.i2i_server:
             self.i2i_server.stop()
 
@@ -872,6 +811,25 @@ class ABCApp(object):
         if self.utility:
             # Niels: lets add a max waiting time for this session shutdown.
             session_shutdown_start = time()
+
+            # TODO(emilon): probably more notification callbacks should be remmoved
+            # here
+            s = self.utility.session
+            s.remove_observer(self.sesscb_ntfy_newversion)
+            s.remove_observer(self.sesscb_ntfy_corrupt_torrent)
+            s.remove_observer(self.sesscb_ntfy_magnet)
+            s.remove_observer(self.sesscb_ntfy_torrentfinished)
+            s.remove_observer(self.sesscb_ntfy_markingupdates)
+            s.remove_observer(self.sesscb_ntfy_moderationupdats)
+            s.remove_observer(self.sesscb_ntfy_modificationupdates)
+            s.remove_observer(self.sesscb_ntfy_commentupdates)
+            s.remove_observer(self.sesscb_ntfy_playlistupdates)
+            s.remove_observer(self.sesscb_ntfy_torrentupdates)
+            s.remove_observer(self.sesscb_ntfy_myprefupdates)
+            s.remove_observer(self.sesscb_ntfy_channelupdates)
+            s.remove_observer(self.sesscb_ntfy_channelupdates)
+            s.remove_observer(self.sesscb_ntfy_activities)
+            s.remove_observer(self.sesscb_ntfy_reachable)
 
             try:
                 self._logger.info("ONEXIT cleaning database")
@@ -902,7 +860,6 @@ class ABCApp(object):
             self._logger.info("ONEXIT Session is shutdown")
 
         self.utility.session.notifier.notify(NTFY_CLOSE_TICK, NTFY_INSERT, None, 'Deleting instances')
-        wx.Yield()
         self._logger.debug("ONEXIT deleting instances")
 
         Session.del_instance()
@@ -937,38 +894,6 @@ class ABCApp(object):
         if self.params[0] != "":
             self.guiUtility.ShowPage('my_files')
 
-    def i2ithread_readlinecallback(self, ic, cmd):
-        """ Called by Instance2Instance thread """
-
-        self._logger.info("main: Another instance called us with cmd %s", cmd)
-        ic.close()
-
-        if cmd.startswith('START '):
-            param = cmd[len('START '):].strip().decode("utf-8")
-            torrentfilename = None
-            if param.startswith('http:'):
-                # Retrieve from web
-                f = tempfile.NamedTemporaryFile()
-                n = urllib2.urlopen(param)
-                data = n.read()
-                f.write(data)
-                f.close()
-                n.close()
-                torrentfilename = f.name
-            else:
-                torrentfilename = param
-
-            # Switch to GUI thread
-            # New for 5.0: Start in VOD mode
-            def start_asked_download():
-                if torrentfilename.startswith("magnet:"):
-                    self.frame.startDownloadFromMagnet(torrentfilename)
-                else:
-                    self.frame.startDownload(torrentfilename)
-                self.guiUtility.ShowPage('my_files')
-
-            wx.CallAfter(start_asked_download)
-
 
 #
 #
@@ -989,19 +914,11 @@ def run(params=[""], autoload_discovery=True, use_torrent_search=True, use_chann
             params = sys.argv[1:]
     try:
         # Create single instance semaphore
-        single_instance_checker = SingleInstanceChecker("tribler")
+        process_checker = ProcessChecker()
 
         installdir = determine_install_dir()
 
-        if not ALLOW_MULTIPLE and single_instance_checker.IsAnotherRunning():
-            statedir = SessionStartupConfig().get_state_dir()
-
-            # Send  torrent info to abc single instance
-            if params[0] != "":
-                torrentfilename = params[0]
-                i2i_port = Utility(installdir, statedir).read_config('i2ilistenport')
-                Instance2InstanceClient(i2i_port, 'START', torrentfilename)
-
+        if not ALLOW_MULTIPLE and process_checker.already_running:
             logger.info("Client shutting down. Detected another instance.")
         else:
             # Launch first abc single instance
@@ -1021,6 +938,8 @@ def run(params=[""], autoload_discovery=True, use_torrent_search=True, use_chann
             abc.OnExit()
 
             # Niels: No code should be present here, only executed after gui closes
+
+        process_checker.remove_lock_file()
 
         logger.info("Client shutting down. Sleeping for a few seconds to allow other threads to finish")
         sleep(5)

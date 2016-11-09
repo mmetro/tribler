@@ -5,6 +5,7 @@ import binascii
 import errno
 import logging
 import os
+import random
 import sys
 import time as timemod
 from glob import iglob
@@ -12,20 +13,27 @@ from threading import Event, enumerate as enumerate_threads
 from traceback import print_exc
 
 from twisted.internet import reactor
+from twisted.internet.defer import Deferred, inlineCallbacks
+from twisted.internet.task import deferLater, LoopingCall
+from twisted.internet.threads import deferToThread
+from twisted.python.threadable import isInIOThread
 
-from Tribler.Core.APIImplementation.threadpoolmanager import ThreadPoolManager
 from Tribler.Core.CacheDB.sqlitecachedb import forceDBThread
-from Tribler.Core.DownloadConfig import DownloadStartupConfig
+from Tribler.Core.DownloadConfig import DownloadStartupConfig, DefaultDownloadStartupConfig
 from Tribler.Core.Modules.search_manager import SearchManager
+from Tribler.Core.Modules.versioncheck_manager import VersionCheckManager
+from Tribler.Core.Modules.watch_folder import WatchFolder
 from Tribler.Core.TorrentDef import TorrentDef, TorrentDefNoMetainfo
 from Tribler.Core.Utilities.configparser import CallbackConfigParser
-from Tribler.Core.Video.VideoPlayer import VideoPlayer
+from Tribler.Core.Video.VideoServer import VideoServer
+from Tribler.Core.defaults import tribler_defaults
 from Tribler.Core.exceptions import DuplicateDownloadException
-from Tribler.Core.simpledefs import NTFY_DISPERSY, NTFY_STARTED, NTFY_TORRENTS, NTFY_UPDATE
-from Tribler.Main.globals import DefaultDownloadStartupConfig
+from Tribler.Core.simpledefs import (NTFY_DISPERSY, NTFY_STARTED, NTFY_TORRENTS, NTFY_UPDATE, NTFY_TRIBLER,
+                                     NTFY_FINISHED, DLSTATUS_DOWNLOADING, DLSTATUS_STOPPED_ON_ERROR, NTFY_ERROR,
+                                     DLSTATUS_SEEDING)
+from Tribler.community.tunnel.tunnel_community import TunnelSettings
 from Tribler.dispersy.taskmanager import TaskManager
 from Tribler.dispersy.util import blockingCallFromThread, blocking_call_on_reactor_thread
-
 
 try:
     import prctl
@@ -51,6 +59,10 @@ class TriblerLaunchMany(TaskManager):
         self.initComplete = False
         self.registered = False
         self.dispersy = None
+        self.state_cb_count = 0
+        self.previous_active_downloads = []
+        self.download_states_lc = None
+        self.get_peer_list = []
 
         self._logger = logging.getLogger(self.__class__.__name__)
 
@@ -64,13 +76,15 @@ class TriblerLaunchMany(TaskManager):
         self.shutdownstarttime = None
 
         # modules
-        self.threadpool = ThreadPoolManager()
         self.torrent_store = None
         self.metadata_store = None
         self.rtorrent_handler = None
         self.tftp_handler = None
+        self.api_manager = None
+        self.watch_folder = None
+        self.version_check_manager = None
 
-        self.cat = None
+        self.category = None
         self.peer_db = None
         self.torrent_db = None
         self.mypref_db = None
@@ -80,7 +94,7 @@ class TriblerLaunchMany(TaskManager):
         self.search_manager = None
         self.channel_manager = None
 
-        self.videoplayer = None
+        self.video_server = None
 
         self.mainline_dht = None
         self.ltmgr = None
@@ -88,7 +102,12 @@ class TriblerLaunchMany(TaskManager):
         self.torrent_checker = None
         self.tunnel_community = None
 
-    def register(self, session, sesslock, autoload_discovery=True):
+        self.startup_deferred = Deferred()
+
+        self.boosting_manager = None
+
+    def register(self, session, sesslock):
+        assert isInIOThread()
         if not self.registered:
             self.registered = True
 
@@ -113,11 +132,11 @@ class TriblerLaunchMany(TaskManager):
                 from Tribler.Core.CacheDB.SqliteCacheDBHandler import (PeerDBHandler, TorrentDBHandler,
                                                                        MyPreferenceDBHandler, VoteCastDBHandler,
                                                                        ChannelCastDBHandler)
-                from Tribler.Category.Category import Category
+                from Tribler.Core.Category.Category import Category
 
                 self._logger.debug('tlm: Reading Session state from %s', self.session.get_state_dir())
 
-                self.cat = Category.getInstance()
+                self.category = Category()
 
                 # create DBHandlers
                 self.peer_db = PeerDBHandler(self.session)
@@ -137,11 +156,11 @@ class TriblerLaunchMany(TaskManager):
                 self.tracker_manager = TrackerManager(self.session)
                 self.tracker_manager.initialize()
 
-            if self.session.get_videoplayer():
-                self.videoplayer = VideoPlayer(self.session)
+            if self.session.get_videoserver_enabled():
+                self.video_server = VideoServer(self.session.get_videoserver_port(), self.session)
+                self.video_server.start()
 
             # Dispersy
-            self.session.dispersy_member = None
             self.tftp_handler = None
             if self.session.get_dispersy():
                 from Tribler.dispersy.dispersy import Dispersy
@@ -163,16 +182,23 @@ class TriblerLaunchMany(TaskManager):
                 self.search_manager.initialize()
 
         if not self.initComplete:
-            self.init(autoload_discovery)
+            self.init()
 
-    def init(self, autoload_discovery):
+        self.session.add_observer(self.on_tribler_started, NTFY_TRIBLER, [NTFY_STARTED])
+        self.session.notifier.notify(NTFY_TRIBLER, NTFY_STARTED, None)
+        return self.startup_deferred
+
+    def on_tribler_started(self, subject, changetype, objectID, *args):
+        reactor.callFromThread(self.startup_deferred.callback, None)
+
+    def init(self):
         if self.dispersy:
             from Tribler.dispersy.community import HardKilledCommunity
 
             self._logger.info("lmc: Starting Dispersy...")
 
             now = timemod.time()
-            success = self.dispersy.start(autoload_discovery)
+            success = self.dispersy.start(self.session.autoload_discovery)
 
             diff = timemod.time() - now
             if success:
@@ -198,18 +224,73 @@ class TriblerLaunchMany(TaskManager):
 
             @blocking_call_on_reactor_thread
             def load_communities():
-                # load communities
+                self._logger.info("tribler: Preparing communities...")
+                now_time = timemod.time()
+                default_kwargs = {'tribler_session': self.session}
+
                 # Search Community
                 if self.session.get_enable_torrent_search():
                     from Tribler.community.search.community import SearchCommunity
                     self.dispersy.define_auto_load(SearchCommunity, self.session.dispersy_member, load=True,
-                                                   kargs={'tribler_session': self.session})
+                                                   kargs=default_kwargs)
 
                 # AllChannel Community
                 if self.session.get_enable_channel_search():
                     from Tribler.community.allchannel.community import AllChannelCommunity
                     self.dispersy.define_auto_load(AllChannelCommunity, self.session.dispersy_member, load=True,
-                                                   kargs={'tribler_session': self.session})
+                                                   kargs=default_kwargs)
+
+                # Bartercast Community
+                if self.session.get_barter_community_enabled():
+                    from Tribler.community.bartercast4.community import BarterCommunity
+                    self.dispersy.define_auto_load(BarterCommunity, self.session.dispersy_member, load=True)
+
+                # Channel Community
+                if self.session.get_channel_community_enabled():
+                    from Tribler.community.channel.community import ChannelCommunity
+                    self.dispersy.define_auto_load(ChannelCommunity,
+                                                   self.session.dispersy_member, load=True, kargs=default_kwargs)
+
+                # PreviewChannel Community
+                if self.session.get_preview_channel_community_enabled():
+                    from Tribler.community.channel.preview import PreviewChannelCommunity
+                    self.dispersy.define_auto_load(PreviewChannelCommunity,
+                                                   self.session.dispersy_member, kargs=default_kwargs)
+
+                if self.session.get_tunnel_community_enabled():
+                    tunnel_settings = TunnelSettings(tribler_session=self.session)
+                    tunnel_kwargs = {'tribler_session': self.session, 'settings': tunnel_settings}
+
+                    if self.session.get_enable_multichain():
+                        multichain_kwargs = {'tribler_session': self.session}
+
+                        # If the multichain is enabled, we use the permanent multichain keypair
+                        # for both the multichain and the tunnel community
+                        keypair = self.session.multichain_keypair
+                        dispersy_member = self.dispersy.get_member(private_key=keypair.key_to_bin())
+
+                        from Tribler.community.multichain.community import MultiChainCommunity
+                        self.dispersy.define_auto_load(MultiChainCommunity,
+                                                       dispersy_member,
+                                                       load=True,
+                                                       kargs=multichain_kwargs)
+
+                        from Tribler.community.tunnel.hidden_community_multichain import HiddenTunnelCommunityMultichain
+                        self.tunnel_community = self.dispersy.define_auto_load(
+                            HiddenTunnelCommunityMultichain, dispersy_member, load=True, kargs=tunnel_kwargs)[0]
+                    else:
+                        keypair = self.dispersy.crypto.generate_key(u"curve25519")
+                        dispersy_member = self.dispersy.get_member(private_key=self.dispersy.crypto.key_to_bin(keypair))
+
+                        from Tribler.community.tunnel.hidden_community import HiddenTunnelCommunity
+                        self.tunnel_community = self.dispersy.define_auto_load(
+                            HiddenTunnelCommunity, dispersy_member, load=True, kargs=tunnel_kwargs)[0]
+
+                self.session.set_anon_proxy_settings(2, ("127.0.0.1",
+                                                         self.session.get_tunnel_community_socks5_listen_ports()))
+
+                self._logger.info("tribler: communities are ready in %.2f seconds", timemod.time() - now_time)
+
             load_communities()
 
             if self.session.get_enable_channel_search():
@@ -244,9 +325,24 @@ class TriblerLaunchMany(TaskManager):
         if self.rtorrent_handler:
             self.rtorrent_handler.initialize()
 
+        if self.api_manager:
+            self.api_manager.root_endpoint.start_endpoints()
+
+        if self.session.get_watch_folder_enabled():
+            self.watch_folder = WatchFolder(self.session)
+            self.watch_folder.start()
+
+        if self.session.get_creditmining_enable():
+            from Tribler.Policies.BoostingManager import BoostingManager
+            self.boosting_manager = BoostingManager(self.session)
+
+        self.version_check_manager = VersionCheckManager(self.session)
+        self.session.set_download_states_callback(self.sesscb_states_callback)
+
         self.initComplete = True
 
-    def add(self, tdef, dscfg, pstate=None, initialdlstatus=None, setupDelay=0, hidden=False):
+    def add(self, tdef, dscfg, pstate=None, initialdlstatus=None, setupDelay=0, hidden=False,
+            share_mode=False, checkpoint_disabled=False):
         """ Called by any thread """
         d = None
         with self.sesslock:
@@ -270,8 +366,9 @@ class TriblerLaunchMany(TaskManager):
 
             # Store in list of Downloads, always.
             self.downloads[infohash] = d
-            d.setup(dscfg, pstate, initialdlstatus, self.network_engine_wrapper_created_callback,
-                    wrapperDelay=setupDelay)
+            setup_deferred = d.setup(dscfg, pstate, initialdlstatus, wrapperDelay=setupDelay,
+                                     share_mode=share_mode, checkpoint_disabled=checkpoint_disabled)
+            setup_deferred.addCallback(self.on_download_wrapper_created)
 
         if d and not hidden and self.session.get_megacache():
             @forceDBThread
@@ -292,10 +389,10 @@ class TriblerLaunchMany(TaskManager):
 
         return d
 
-    def network_engine_wrapper_created_callback(self, d, pstate):
+    def on_download_wrapper_created(self, (d, pstate)):
         """ Called by network thread """
         try:
-            if pstate is None:
+            if pstate is None and not d.get_checkpoint_disabled():
                 # Checkpoint at startup
                 (infohash, pstate) = d.network_checkpoint()
                 self.save_download_pstate(infohash, pstate)
@@ -387,41 +484,98 @@ class TriblerLaunchMany(TaskManager):
     #
     # State retrieval
     #
-    def set_download_states_callback(self, usercallback, getpeerlist, when=0.0):
-        """ Called by any thread """
-        for d in self.downloads.values():
-            # Arno, 2012-05-23: At Niels' request to get total transferred
-            # stats. Causes MOREINFO message to be sent from swift proc
-            # for every initiated dl.
-            # 2012-07-31: Turn MOREINFO on/off on demand for efficiency.
-            # 2013-04-17: Libtorrent now uses set_moreinfo_stats as well.
-            d.set_moreinfo_stats(True in getpeerlist or d.get_def().get_infohash() in getpeerlist)
+    def stop_download_states_callback(self):
+        """
+        Stop any download states callback if present.
+        """
+        if self.is_pending_task_active("download_states_lc"):
+            self.cancel_pending_task("download_states_lc")
 
-        network_set_download_states_callback_lambda = lambda: self.network_set_download_states_callback(usercallback)
-        self.threadpool.add_task(network_set_download_states_callback_lambda, when)
+    def set_download_states_callback(self, usercallback, interval=1.0):
+        """
+        Set the download state callback. Remove any old callback if it's present.
+        """
+        self.stop_download_states_callback()
+        self._logger.debug("Starting the download state callback with interval %f", interval)
+        self.download_states_lc = self.register_task("download_states_lc",
+                                                     LoopingCall(self._invoke_states_cb, usercallback))
+        self.download_states_lc.start(interval)
 
-    def network_set_download_states_callback(self, usercallback):
-        """ Called by network thread """
+    def _invoke_states_cb(self, callback):
+        """
+        Invoke the download states callback with a list of the download states.
+        """
         dslist = []
         for d in self.downloads.values():
-            try:
-                ds = d.network_get_state(None, False)
-                dslist.append(ds)
-            except:
-                # Niels, 2012-10-18: If Swift connection is crashing, it will raise an exception
-                # We're catching it here to continue building the downloadstates
-                print_exc()
+            d.set_moreinfo_stats(True in self.get_peer_list or d.get_def().get_infohash() in
+                                 self.get_peer_list)
+            ds = d.network_get_state(None, False)
+            dslist.append(ds)
 
-        # Invoke the usercallback function on a separate thread.
-        # After the callback is invoked, the return values will be passed to the
-        # returncallback for post-callback processing.
-        def session_getstate_usercallback_target():
-            when, newgetpeerlist = usercallback(dslist)
-            if when > 0.0:
-                # reschedule
-                self.set_download_states_callback(usercallback, newgetpeerlist, when=when)
+        def on_cb_done(new_get_peer_list):
+            self.get_peer_list = new_get_peer_list
 
-        self.threadpool.add_task(session_getstate_usercallback_target)
+        return deferToThread(callback, dslist).addCallback(on_cb_done)
+
+    def sesscb_states_callback(self, states_list):
+        """
+        This method is periodically (every second) called with a list of the download states of the active downloads.
+        """
+        self.state_cb_count += 1
+
+        # Check to see if a download has finished
+        new_active_downloads = []
+        do_checkpoint = False
+        seeding_download_list = []
+
+        for ds in states_list:
+            state = ds.get_status()
+            download = ds.get_download()
+            tdef = download.get_def()
+            safename = tdef.get_name_as_unicode()
+
+            if state == DLSTATUS_DOWNLOADING:
+                new_active_downloads.append(safename)
+            elif state == DLSTATUS_STOPPED_ON_ERROR:
+                self._logger.error("Error during download: %s", repr(ds.get_error()))
+                self.downloads.get(tdef.get_infohash()).stop()
+                self.session.notifier.notify(NTFY_TORRENTS, NTFY_ERROR, tdef.get_infohash(), repr(ds.get_error()))
+            elif state == DLSTATUS_SEEDING:
+                seeding_download_list.append({u'infohash': tdef.get_infohash(),
+                                              u'download': download})
+
+                if safename in self.previous_active_downloads:
+                    self.session.notifier.notify(NTFY_TORRENTS, NTFY_FINISHED, tdef.get_infohash(), safename)
+                    do_checkpoint = True
+
+                elif download.get_hops() == 0 and download.get_safe_seeding():
+                    hops = tribler_defaults.get('Tribler', {}).get('default_number_hops', 1)
+                    self._logger.info("Moving completed torrent to tunneled session %d for hidden seeding %r",
+                                      hops, download)
+                    self.session.remove_download(download)
+
+                    # copy the old download_config and change the hop count
+                    dscfg = download.copy()
+                    dscfg.set_hops(hops)
+
+                    # TODO(emilon): That's a hack to work around the fact that removing a torrent is racy.
+                    def schedule_download():
+                        self.register_task(
+                            "reschedule_download", reactor.callLater(5,
+                                                                     reactor.callInThread,
+                                                                     self.session.start_download_from_tdef,
+                                                                     tdef, dscfg))
+
+                    reactor.callFromThread(schedule_download)
+
+        self.previous_active_downloads = new_active_downloads
+        if do_checkpoint:
+            self.session.checkpoint()
+
+        if self.state_cb_count % 4 == 0 and self.tunnel_community:
+            self.tunnel_community.monitor_downloads(states_list)
+
+        return []
 
     #
     # Persistence methods
@@ -524,9 +678,7 @@ class TriblerLaunchMany(TaskManager):
         dllist = self.downloads.values()
         self._logger.debug("tlm: checkpointing %s stopping %s", len(dllist), stop)
 
-        network_checkpoint_callback_lambda = lambda: self.network_checkpoint_callback(dllist, stop, checkpoint,
-                                                                                      gracetime)
-        self.threadpool.add_task(network_checkpoint_callback_lambda, 0.0)
+        return deferLater(reactor, 0, self.network_checkpoint_callback, dllist, stop, checkpoint, gracetime)
 
     def network_checkpoint_callback(self, dllist, stop, checkpoint, gracetime):
         """ Called by network thread """
@@ -550,6 +702,7 @@ class TriblerLaunchMany(TaskManager):
                     self._logger.exception("Exception while checkpointing: %s", d.get_def().get_name())
 
         if stop:
+            delay = 0
             # Some grace time for early shutdown tasks
             if self.shutdownstarttime is not None:
                 now = timemod.time()
@@ -557,11 +710,7 @@ class TriblerLaunchMany(TaskManager):
                 if diff < gracetime:
                     self._logger.info("tlm: shutdown: delaying for early shutdown tasks %s", gracetime - diff)
                     delay = gracetime - diff
-                    network_shutdown_callback_lambda = lambda: self.network_shutdown()
-                    self.threadpool.add_task(network_shutdown_callback_lambda, delay)
-                    return
-
-            self.network_shutdown()
+            return deferLater(reactor, delay, self.network_shutdown)
 
     def remove_pstate(self, infohash):
         def do_remove():
@@ -582,12 +731,14 @@ class TriblerLaunchMany(TaskManager):
             else:
                 self._logger.warning("remove pstate: download is back, restarted? Canceling removal! %s",
                                       repr(infohash))
-        self.threadpool.add_task(do_remove)
+        reactor.callFromThread(do_remove)
 
+    @inlineCallbacks
     def early_shutdown(self):
         """ Called as soon as Session shutdown is initiated. Used to start
         shutdown tasks that takes some time and that can run in parallel
         to checkpointing, etc.
+        :returns a Deferred that will fire once all dependencies acknowledge they have shutdown.
         """
         self._logger.info("tlm: early_shutdown")
 
@@ -595,31 +746,43 @@ class TriblerLaunchMany(TaskManager):
 
         # Note: sesslock not held
         self.shutdownstarttime = timemod.time()
+        if self.boosting_manager:
+            yield self.boosting_manager.shutdown()
+        self.boosting_manager = None
+
         if self.torrent_checker:
-            self.torrent_checker.shutdown()
-            self.torrent_checker = None
+            yield self.torrent_checker.shutdown()
+        self.torrent_checker = None
+
         if self.channel_manager:
-            self.channel_manager.shutdown()
-            self.channel_manager = None
+            yield self.channel_manager.shutdown()
+        self.channel_manager = None
+
         if self.search_manager:
-            self.search_manager.shutdown()
-            self.search_manager = None
+            yield self.search_manager.shutdown()
+        self.search_manager = None
+
         if self.rtorrent_handler:
-            self.rtorrent_handler.shutdown()
-            self.rtorrent_handler = None
-        if self.videoplayer:
-            self.videoplayer.shutdown()
-            self.videoplayer = None
+            yield self.rtorrent_handler.shutdown()
+        self.rtorrent_handler = None
+
+        if self.video_server:
+            yield self.video_server.shutdown_server()
+        self.video_server = None
+
+        if self.version_check_manager:
+            self.version_check_manager.stop()
+        self.version_check_manager = None
 
         if self.tracker_manager:
-            self.tracker_manager.shutdown()
-            self.tracker_manager = None
+            yield self.tracker_manager.shutdown()
+        self.tracker_manager = None
 
         if self.dispersy:
             self._logger.info("lmc: Shutting down Dispersy...")
             now = timemod.time()
             try:
-                success = self.dispersy.stop()
+                success = yield self.dispersy.stop()
             except:
                 print_exc()
                 success = False
@@ -631,34 +794,49 @@ class TriblerLaunchMany(TaskManager):
                 self._logger.info("lmc: Dispersy failed to shutdown in %.2f seconds", diff)
 
         if self.metadata_store is not None:
-            self.metadata_store.close()
-            self.metadata_store = None
+            yield self.metadata_store.close()
+        self.metadata_store = None
 
-        if self.tftp_handler:
-            self.tftp_handler.shutdown()
-            self.tftp_handler = None
+        if self.tftp_handler is not None:
+            yield self.tftp_handler.shutdown()
+        self.tftp_handler = None
 
-        if self.session.get_megacache():
-            self.channelcast_db.close()
-            self.votecast_db.close()
-            self.mypref_db.close()
-            self.torrent_db.close()
-            self.peer_db.close()
+        if self.channelcast_db is not None:
+            yield self.channelcast_db.close()
+        self.channelcast_db = None
 
-            self.channelcast_db = None
-            self.votecast_db = None
-            self.mypref_db = None
-            self.torrent_db = None
-            self.peer_db = None
+        if self.votecast_db is not None:
+            yield self.votecast_db.close()
+        self.votecast_db = None
 
-        if self.mainline_dht:
+        if self.mypref_db is not None:
+            yield self.mypref_db.close()
+        self.mypref_db = None
+
+        if self.torrent_db is not None:
+            yield self.torrent_db.close()
+        self.torrent_db = None
+
+        if self.peer_db is not None:
+            yield self.peer_db.close()
+        self.peer_db = None
+
+        if self.mainline_dht is not None:
             from Tribler.Core.DecentralizedTracking import mainlineDHT
-            mainlineDHT.deinit(self.mainline_dht)
-            self.mainline_dht = None
+            yield mainlineDHT.deinit(self.mainline_dht)
+        self.mainline_dht = None
 
         if self.torrent_store is not None:
-            self.torrent_store.close()
-            self.torrent_store = None
+            yield self.torrent_store.close()
+        self.torrent_store = None
+
+        if self.api_manager is not None:
+            yield self.api_manager.stop()
+        self.api_manager = None
+
+        if self.watch_folder is not None:
+            yield self.watch_folder.stop()
+        self.watch_folder = None
 
     def network_shutdown(self):
         try:
@@ -675,21 +853,17 @@ class TriblerLaunchMany(TaskManager):
         self.sessdoneflag.set()
 
         # Shutdown libtorrent session after checkpoints have been made
-        if self.ltmgr:
+        if self.ltmgr is not None:
             self.ltmgr.shutdown()
             self.ltmgr = None
 
-        if self.threadpool:
-            self.threadpool.cancel_all_pending_tasks()
-            self.threadpool = None
-
     def save_download_pstate(self, infohash, pstate):
         """ Called by network thread """
-        basename = binascii.hexlify(infohash) + '.state'
-        filename = os.path.join(self.session.get_downloads_pstate_dir(), basename)
 
-        self._logger.debug("tlm: network checkpointing: to file %s", filename)
-        pstate.write_file(filename)
+        self.downloads[infohash].pstate_for_restart = pstate
+
+        self.register_task("save_pstate %f" % timemod.clock(),
+                           self.downloads[infohash].save_resume_data())
 
     def load_download_pstate(self, filename):
         """ Called by any thread """
@@ -713,7 +887,11 @@ class TriblerLaunchMany(TaskManager):
                                                    'anon_proxyserver', 'anon_proxytype', 'anon_proxyauth',
                                                    'anon_listen_port']) or \
              (section == 'torrent_collecting' and name in ['stop_collecting_threshold']) or \
-             (section == 'tunnel_community' and name in ['socks5_listen_port']):
+             (section == 'watch_folder') or \
+             (section == 'tunnel_community' and name in ['socks5_listen_port']) or \
+             (section == 'credit_mining' and name in ['max_torrents_per_source', 'max_torrents_active',
+                                                      'source_interval', 'swarm_interval', 'boosting_sources',
+                                                      'boosting_enabled', 'boosting_disabled', 'archive_sources']):
             return True
         else:
             return False

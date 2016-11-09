@@ -3,22 +3,26 @@
 # Note for Developers: Please write a unittest in Tribler/Test/test_sqlitecachedbhandler.py
 # for any function you add to database.
 # Please reuse the functions in sqlitecachedb as much as possible
+import json
 import logging
+import math
 import os
 import threading
-import json
+from collections import OrderedDict, defaultdict
 from copy import deepcopy
+from itertools import chain
+from libtorrent import bencode
 from pprint import pformat
 from struct import unpack_from
 from time import time
 from traceback import print_exc
-from collections import OrderedDict, defaultdict
-from libtorrent import bencode
+
 from twisted.internet.task import LoopingCall
 
 from Tribler.Core.CacheDB.sqlitecachedb import bin2str, str2bin
 from Tribler.Core.TorrentDef import TorrentDef
 from Tribler.Core.Utilities.search_utils import split_into_keywords, filter_keywords
+from Tribler.Core.Utilities.tracker_utils import get_uniformed_tracker_url
 from Tribler.Core.Utilities.unicode import dunno2unicode
 from Tribler.Core.simpledefs import (INFOHASH_LENGTH, NTFY_UPDATE, NTFY_INSERT, NTFY_DELETE, NTFY_CREATE,
                                      NTFY_MODIFIED, NTFY_TRACKERINFO, NTFY_MYPREFERENCES, NTFY_VOTECAST, NTFY_TORRENTS,
@@ -26,8 +30,6 @@ from Tribler.Core.simpledefs import (INFOHASH_LENGTH, NTFY_UPDATE, NTFY_INSERT, 
                                      NTFY_MODERATIONS, NTFY_MARKINGS, NTFY_STATE,
                                      SIGNAL_CHANNEL_COMMUNITY, SIGNAL_ON_TORRENT_UPDATED)
 from Tribler.dispersy.taskmanager import TaskManager
-from Tribler.Core.Utilities.tracker_utils import get_uniformed_tracker_url
-
 
 VOTECAST_FLUSH_DB_INTERVAL = 15
 
@@ -205,7 +207,7 @@ class TorrentDBHandler(BasicDBHandler):
 
         self.keys = ['torrent_id', 'name', 'length', 'creation_date', 'num_files',
                      'insert_time', 'secret', 'relevance', 'category', 'status',
-                     'num_seeders', 'num_leechers', 'comment', 'last_tracker_check']
+                     'num_seeders', 'num_leechers', 'comment', 'last_tracker_check', 'is_collected']
         self.existed_torrents = set()
 
         self.value_name = ['C.torrent_id', 'category', 'status', 'name', 'creation_date', 'num_files',
@@ -222,9 +224,13 @@ class TorrentDBHandler(BasicDBHandler):
 
         self.infohash_id = LimitedOrderedDict(DEFAULT_ID_CACHE_SIZE)
 
+        # We are saving the latest match info object we got so we can assign a relevance score
+        # to incoming remote torrents without doing a full text search.
+        self.latest_matchinfo_torrent = None
+
     def initialize(self, *args, **kwargs):
         super(TorrentDBHandler, self).initialize(*args, **kwargs)
-        self.category = self.session.lm.cat
+        self.category = self.session.lm.category
         self.mypref_db = self.session.open_dbhandler(NTFY_MYPREFERENCES)
         self.votecast_db = self.session.open_dbhandler(NTFY_VOTECAST)
         self.channelcast_db = self.session.open_dbhandler(NTFY_CHANNELCAST)
@@ -815,12 +821,10 @@ class TorrentDBHandler(BasicDBHandler):
     def getTorrentsStats(self):
         return self._db.getOne('CollectedTorrent', ['count(torrent_id)', 'sum(length)', 'sum(num_files)'])
 
-    # TODO martijn: what is the purpose of this method? It seems to behave very strange and does not actually delete
-    # torrents in the database?
     def freeSpace(self, torrents2del):
         if self.channelcast_db and self.channelcast_db._channel_id:
             sql = U"""
-                SELECT name, torrent_id, relevance,
+                SELECT name, torrent_id, infohash, relevance,
                 MIN(relevance, 2500) + MIN(500, num_leechers) + 4*MIN(500, num_seeders) - (MAX(0, MIN(500, (%d - creation_date)/86400)) ) AS weight
                 FROM CollectedTorrent
                 WHERE torrent_id NOT IN (SELECT torrent_id FROM MyPreference)
@@ -830,7 +834,7 @@ class TorrentDBHandler(BasicDBHandler):
             """ % (int(time()), self.channelcast_db._channel_id, torrents2del)
         else:
             sql = u"""
-                SELECT name, torrent_id, relevance,
+                SELECT name, torrent_id, infohash, relevance,
                     min(relevance,2500) +  min(500,num_leechers) + 4*min(500,num_seeders) - (max(0,min(500,(%d-creation_date)/86400)) ) AS weight
                 FROM CollectedTorrent
                 WHERE torrent_id NOT IN (SELECT torrent_id FROM MyPreference)
@@ -840,16 +844,20 @@ class TorrentDBHandler(BasicDBHandler):
 
         res_list = self._db.fetchall(sql)
         if len(res_list) == 0:
-            return False
+            return 0
 
         # delete torrents from db
-        sql_del_torrent = u"UPDATE Torrent SET name = NULL WHERE torrent_id = ?"
-        # sql_del_tracker = "delete from TorrentTracker where torrent_id=?"
+        sql_del_torrent = u"UPDATE Torrent SET name = NULL, is_collected = 0 WHERE torrent_id = ?"
         # sql_del_pref = "delete from Preference where torrent_id=?"
-        tids = [(torrent_id,) for name, torrent_id, relevance, weight in res_list]
+
+        tids = []
+        for _name, torrent_id, infohash, _relevance, _weight in res_list:
+            tids.append((torrent_id,))
+            self.session.delete_collected_torrent(infohash)
 
         self._db.executemany(sql_del_torrent, tids)
         # self._db.executemany(sql_del_tracker, tids)
+        deleted = self._db.connection.changes()
         # self._db.executemany(sql_del_pref, tids)
 
         # but keep the infohash in db to maintain consistence with preference db
@@ -857,15 +865,65 @@ class TorrentDBHandler(BasicDBHandler):
         # sql_insert =  "insert into Torrent (torrent_id, infohash, relevance) values (?,?,?)"
         # self._db.executemany(sql_insert, torrent_id_infohashes)
 
-        deleted = 0  # deleted any file?
-        insert_files = []
-
-        if len(insert_files) > 0:
-            sql_insert_files = "INSERT OR IGNORE INTO TorrentFiles (torrent_id, path, length) VALUES (?,?,?)"
-            self._db.executemany(sql_insert_files, insert_files)
-
         self._logger.info("Erased %d torrents", deleted)
         return deleted
+
+    def search_in_local_torrents_db(self, query, keys=None):
+        """
+        Search in the local database for torrents matching a specific query. This method also assigns a relevance
+        score to each torrent, based on the name, files and file extensions.
+        The algorithm is based on BM25. The document length factor is regarded since our "documents" are very small
+        (often a few keywords).
+        See https://en.wikipedia.org/wiki/Okapi_BM25 for more information about BM25.
+        """
+        search_results = []
+        keys_str = ", ".join(keys)
+        keywords = split_into_keywords(query, to_filter_stopwords=True)
+        infohash_index = keys.index('infohash')
+
+        # This query gets torrents matching speciifc keywords. The matchinfo object is also returned. For more
+        # information about the returned matchinfo parameters, see https://www.sqlite.org/fts3.html#matchinfo.
+        results = self._db.fetchall("SELECT DISTINCT %s, Matchinfo(FullTextIndex, 'pcnalx') "
+                                    "FROM Torrent T, FullTextIndex "
+                                    "LEFT OUTER JOIN _ChannelTorrents C ON T.torrent_id = C.torrent_id "
+                                    "WHERE t.name IS NOT NULL AND t.torrent_id = FullTextIndex.rowid "
+                                    "AND C.deleted_at IS NULL AND FullTextIndex MATCH ?"
+                                    % keys_str, (" OR ".join(keywords),))
+
+        for result in results:
+            result = list(result)  # We convert the result to a mutable list since we have to decode the infohash
+            result[infohash_index] = str2bin(result[infohash_index])
+            matchinfo = result[len(keys)]  # The matchinfo is the last element in the results tuple
+            self.latest_matchinfo_torrent = matchinfo, keywords
+            num_phrases, num_cols, num_rows = unpack_from('III', matchinfo)
+
+            unpack_str = 'I' * (3 * num_cols * num_phrases)
+            matchinfo = unpack_from('I' * 9 + unpack_str, matchinfo)[9:]
+
+            scores = []
+
+            for col_ind in xrange(num_cols):
+                score = 0
+                for phrase_ind in xrange(num_phrases):
+                    # Fetch info about the current matching term. This number is fetched from the matchinfo object.
+                    # See https://www.sqlite.org/fts3.html#matchinfo for info about the offset calculation.
+                    base_term_offset = 3 * (col_ind + phrase_ind * num_cols)
+                    rows_with_term = matchinfo[base_term_offset + 2]
+                    term_freq = matchinfo[base_term_offset]
+
+                    inv_doc_freq = math.log((num_rows - rows_with_term + 0.5) / (rows_with_term + 0.5), 2)
+                    right_side = ((term_freq * (1.2 + 1)) / (term_freq + 1.2))
+
+                    score += inv_doc_freq * right_side
+
+                scores.append(score)
+
+            # Our score is 80% dependent on matching in the name of the torrent, 10% on the names of the files in the
+            # torrent and 10% on the extensions of files in the torrent.
+            extended_result = result + [0.8 * scores[0] + 0.1 * scores[1] + 0.1 * scores[2]]
+            search_results.append(extended_result)
+
+        return search_results
 
     def searchNames(self, kws, local=True, keys=None, doSort=True):
         assert 'infohash' in keys
@@ -953,8 +1011,8 @@ class TorrentDBHandler(BasicDBHandler):
         # step 2, fix all dict fields
         dont_sort_list = []
         results = [list(result) for result in result_dict.values()]
-        for i in xrange(len(results) - 1, -1, -1):
-            result = results[i]
+        for index in xrange(len(results) - 1, -1, -1):
+            result = results[index]
 
             result[infohash_index] = str2bin(result[infohash_index])
 
@@ -984,15 +1042,20 @@ class TorrentDBHandler(BasicDBHandler):
             result.extend(channel)
 
             if doSort and result[num_seeders_index] <= 0:
-                dont_sort_list.append(result)
-                results.pop(i)
-
+                dont_sort_list.append((index, result))
 
         if doSort:
+            # Remove the items with 0 seeders from the results list so the sort is faster, append them to the
+            # results list afterwards.
+            for index, result in dont_sort_list:
+                results.pop(index)
+
             def compare(a, b):
                 return cmp(a[num_seeders_index], b[num_seeders_index])
             results.sort(compare, reverse=True)
-        results.extend(dont_sort_list)
+
+            for index, result in dont_sort_list:
+                results.append(result)
 
         if not local:
             results = results[:25]
@@ -1628,9 +1691,10 @@ ORDER BY CMD.time_stamp DESC LIMIT ?;
         playlist_id = self._db.fetchone(get_playlist, (playlist_dispersy_id, channel_id))
 
         if playlist_id:
-            get_channeltorent_id = """SELECT id FROM _ChannelTorrents, Torrent
-            WHERE _ChannelTorrents.torrent_id = Torrent.torrent_id AND Torrent.infohash = ?"""
-            channeltorrent_id = self._db.fetchone(get_channeltorent_id, (bin2str(infohash),))
+            get_channeltorent_id = """SELECT _ChannelTorrents.id FROM _ChannelTorrents, Torrent, _PlaylistTorrents
+            WHERE _ChannelTorrents.torrent_id = Torrent.torrent_id AND _ChannelTorrents.id =
+            _PlaylistTorrents.channeltorrent_id AND playlist_id = ? AND Torrent.infohash = ?"""
+            channeltorrent_id = self._db.fetchone(get_channeltorent_id, (playlist_id, bin2str(infohash)))
 
             if channeltorrent_id:
                 sql = "UPDATE _PlaylistTorrents SET deleted_at = ? WHERE playlist_id = ? AND channeltorrent_id = ?"
@@ -1869,6 +1933,16 @@ ORDER BY CMD.time_stamp DESC LIMIT ?;
               WHERE Torrent.torrent_id = ChannelTorrents.torrent_id AND infohash = ?"""
         results = self._db.fetchall(sql, (bin2str(infohash),))
 
+        return self.__fixTorrents(keys, results)
+
+    def get_random_channel_torrents(self, keys, limit=10):
+        """
+        Return some random (channel) torrents from the database.
+        """
+        sql = "SELECT %s FROM ChannelTorrents, Torrent " \
+              "WHERE ChannelTorrents.torrent_id = Torrent.torrent_id AND Torrent.name IS NOT NULL " \
+              "ORDER BY RANDOM() LIMIT ?" % ", ".join(keys)
+        results = self._db.fetchall(sql, (limit,))
         return self.__fixTorrents(keys, results)
 
     def getTorrentFromChannelTorrentId(self, channeltorrent_id, keys):
@@ -2191,6 +2265,55 @@ ORDER BY CMD.time_stamp DESC LIMIT ?;
             return results
         return []
 
+    @staticmethod
+    def calculate_score_channel(keywords, channel_name, channel_description):
+        """
+        Calculate the relevance score of a channel from the database.
+        The algorithm used is a very stripped-down version of BM25 where only the matching terms are counted.
+        """
+        values = [channel_name, channel_description]
+        scores = []
+        for col_ind in xrange(2):
+            score = 0
+            for keyword in keywords:
+                term_freq = values[col_ind].lower().count(keyword)
+
+                right_side = ((term_freq * (1.2 + 1)) / (term_freq + 1.2))
+                score += right_side
+
+            scores.append(score)
+
+        # The relevance score is 80% dependent on the matching in the channel name
+        # and 20% on the matching in the channel description.
+        return 0.8 * scores[0] + 0.2 * scores[1]
+
+    def search_in_local_channels_db(self, query):
+        """
+        Searches for matching channels against a given query in the database.
+        """
+        search_results = []
+        keywords = split_into_keywords(query, to_filter_stopwords=True)
+        sql = "SELECT id, dispersy_cid, name, description, nr_torrents, nr_favorite, nr_spam, modified " \
+              "FROM Channels WHERE "
+        for _ in xrange(len(keywords)):
+            sql += " name LIKE ? OR description LIKE ? OR "
+        sql = sql[:-4]
+
+        bindings = list(chain.from_iterable(['%%%s%%' % keyword] * 2 for keyword in keywords))
+        results = self._db.fetchall(sql, bindings)
+
+        my_votes = self.votecast_db.getMyVotes()
+
+        for result in results:
+            my_vote = my_votes.get(result[0], 0)
+
+            relevance_score = ChannelCastDBHandler.calculate_score_channel(keywords, result[2], result[3])
+            extended_result = (result[0], str(result[1]), result[2], result[3],
+                               result[4], result[5], result[6], my_vote, result[7], relevance_score)
+            search_results.append(extended_result)
+
+        return search_results
+
     def searchChannels(self, keywords):
         sql = "SELECT id, name, description, dispersy_cid, modified, nr_torrents, nr_favorite, nr_spam " + \
               "FROM Channels WHERE"
@@ -2262,11 +2385,11 @@ ORDER BY CMD.time_stamp DESC LIMIT ?;
               "FROM Channels ORDER BY nr_favorite DESC, modified DESC LIMIT ?"
         return self._getChannels(sql, (max_nr,), includeSpam=False)
 
-    def getMySubscribedChannels(self, includeDispsersy=False):
+    def getMySubscribedChannels(self, include_dispersy=False):
         sql = "SELECT id, name, description, dispersy_cid, modified, nr_torrents, nr_favorite, nr_spam " + \
               "FROM Channels, ChannelVotes " + \
               "WHERE Channels.id = ChannelVotes.channel_id AND voter_id ISNULL AND vote == 2"
-        if not includeDispsersy:
+        if not include_dispersy:
             sql += " AND dispersy_cid == -1"
 
         return self._getChannels(sql)
@@ -2372,3 +2495,10 @@ ORDER BY CMD.time_stamp DESC LIMIT ?;
                 elif channel[5] == best_channel[5] and channel[4] > best_channel[4]:
                     best_channel = channel
             return best_channel
+
+    def get_torrent_ids_from_playlist(self, playlist_id):
+        """
+        Returns the torrent dispersy IDs from a specified playlist.
+        """
+        sql = "SELECT dispersy_id FROM PlaylistTorrents WHERE playlist_id = ?"
+        return self._db.fetchall(sql, (playlist_id,))

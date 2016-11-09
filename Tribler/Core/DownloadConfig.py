@@ -12,14 +12,19 @@
 # 3. Document your changes in API.py
 #
 #
+import copy
+import logging
 
 import os
+from ConfigParser import ParsingError, MissingSectionHeaderError
 from types import StringType
 
 from Tribler.Core.Utilities.configparser import CallbackConfigParser
 from Tribler.Core.defaults import dldefaults
 from Tribler.Core.osutils import get_home_dir
 from Tribler.Core.simpledefs import DLMODE_VOD, STATEDIR_DLCONFIG, UPLOAD
+
+logger = logging.getLogger(__name__)
 
 
 class DownloadConfigInterface(object):
@@ -191,8 +196,9 @@ class DownloadStartupConfig(DownloadConfigInterface):
         dlconfig = CallbackConfigParser()
         try:
             dlconfig.read_file(filename)
-        except:
-            raise IOError, "Failed to open download config file"
+        except (ParsingError, IOError, MissingSectionHeaderError):
+            logger.error("Failed to open download config file: %s", filename)
+            raise
 
         return DownloadStartupConfig(dlconfig)
 
@@ -207,6 +213,46 @@ class DownloadStartupConfig(DownloadConfigInterface):
 
     def copy(self):
         return DownloadStartupConfig(self.dlconfig.copy())
+
+
+class DefaultDownloadStartupConfig(DownloadStartupConfig):
+    """
+    This class is used to quickly get information about the default download startup config.
+    This is used for instance when adding a new torrent to the downloads. In this case, the default
+    download settings should be accessed and displayed to the user.
+    """
+    __single = None
+
+    def __init__(self, dlconfig=None):
+
+        if DefaultDownloadStartupConfig.__single:
+            raise RuntimeError("DefaultDownloadStartupConfig is singleton")
+        DefaultDownloadStartupConfig.__single = self
+
+        DownloadStartupConfig.__init__(self, dlconfig=dlconfig)
+
+        self._logger = logging.getLogger(self.__class__.__name__)
+
+    @staticmethod
+    def getInstance(*args, **kw):
+        if DefaultDownloadStartupConfig.__single is None:
+            DefaultDownloadStartupConfig(*args, **kw)
+        return DefaultDownloadStartupConfig.__single
+
+    @staticmethod
+    def delInstance(*args, **kw):
+        DefaultDownloadStartupConfig.__single = None
+
+    @staticmethod
+    def load(filename):
+        dlconfig = CallbackConfigParser()
+        dlconfig.read_file(filename)
+        return DefaultDownloadStartupConfig(dlconfig)
+
+    def copy(self):
+        config = CallbackConfigParser()
+        config._sections = {'downloadconfig': copy.deepcopy(self.dlconfig._sections['downloadconfig'])}
+        return DownloadStartupConfig(config)
 
 
 def get_default_dest_dir():
